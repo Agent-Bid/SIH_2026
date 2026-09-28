@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Run every testbench (and its Python checker, if it has one) and print a summary.
+#   sim/all
+cd "$(dirname "$0")/.."
+
+declare -A checker=(
+    [dds_tb]=host/check_dds.py
+    [pulse_dds_tb]=host/check_pulse.py
+    [chirp_tb]=host/check_chirp.py
+    [bpsk_tb]=host/check_bpsk.py
+    [top_tb]="host/capture.py --file sim/out/top_uart.txt"
+)
+
+fails=0
+for tb in phase_acc_tb pulse_ctrl_tb phase_code_tb dds_tb pulse_dds_tb chirp_tb bpsk_tb top_tb; do
+    [[ -f sim/$tb.v ]] || continue
+    if ! out=$(sim/run "$tb" 2>&1); then
+        result="FAIL (did not compile: $(grep -m1 -iE 'error' <<<"$out"))"
+    elif [[ -n "${checker[$tb]}" ]]; then
+        result=$(python3 ${checker[$tb]} 2>&1 | tail -1)
+    else
+        result=$(grep -E '^(PASS|FAIL)' <<<"$out" | tail -1)
+    fi
+    [[ "$result" == PASS* ]] || fails=$((fails + 1))
+    printf "%-15s %s\n" "$tb" "$result"
+done
+
+echo
+if (( fails == 0 )); then echo "ALL PASS"; else echo "$fails FAILING"; exit 1; fi

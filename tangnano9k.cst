@@ -1,0 +1,35 @@
+// Tang Nano 9K pin constraints. Every port of the top module needs an IO_LOC here.
+
+// 27 MHz clock
+IO_LOC  "clk" 52;
+IO_PORT "clk" PULL_MODE=UP;
+
+// Buttons S1/S2 (active-low)
+IO_LOC  "btn1" 3;
+IO_PORT "btn1" PULL_MODE=UP;
+IO_LOC  "btn2" 4;
+IO_PORT "btn2" PULL_MODE=UP;
+
+// LEDs (active-low)
+IO_LOC "led[0]" 10;
+IO_LOC "led[1]" 11;
+IO_LOC "led[2]" 13;
+IO_LOC "led[3]" 14;
+IO_LOC "led[4]" 15;
+IO_LOC "led[5]" 16;
+
+// USB UART (shows up as /dev/ttyUSB1)
+IO_LOC "uart_tx" 17;
+IO_LOC "uart_rx" 18;
+IO_PORT "uart_rx" PULL_MODE=UP;
+
+// 8-bit parallel DAC + its clock, on 3.3 V header pins (pins 79-86 are 1.8 V: avoid)
+IO_LOC "dac_d[0]" 25;
+IO_LOC "dac_d[1]" 26;
+IO_LOC "dac_d[2]" 27;
+IO_LOC "dac_d[3]" 28;
+IO_LOC "dac_d[4]" 29;
+IO_LOC "dac_d[5]" 30;
+IO_LOC "dac_d[6]" 33;
+IO_LOC "dac_d[7]" 34;
+IO_LOC "dac_clk"  35;

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# Run one testbench in the simulator.
+#
+#   sim/run phase_acc_tb          compile + run, print PASS/FAIL
+#   sim/run phase_acc_tb -w       same, then open the waves in GTKWave
+#
+# Compiles sim/<name>.v together with every design file (*.v) in the project
+# root, runs it from the project root, and leaves the waves in sim/out/<name>.vcd.
+set -euo pipefail
+cd "$(dirname "$0")/.."                      # always run from the project root
+
+tb="${1:?usage: sim/run <testbench name> [-w]}"
+mkdir -p sim/out
+
+iverilog -g2012 -Wall -Wno-timescale -s "$tb" -o "sim/out/$tb.vvp" "sim/$tb.v" *.v
+vvp -n "sim/out/$tb.vvp"
+
+if [[ "${2:-}" == "-w" ]]; then
+    gtkwave "sim/out/$tb.vcd" >/dev/null 2>&1 &
+fi
