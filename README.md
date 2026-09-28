@@ -16,6 +16,7 @@ tn9k load                                   # build + load into the FPGA (volati
 python3 host/wavegen.py chirp --fc 325e3 --bw 350e3 --len 16000 --capture
 python3 host/wavegen.py chirp --fc 325e3 --bw 350e3 --down --capture
 python3 host/wavegen.py bpsk  --fc 300e3 --chip-len 1000 --code barker13 --capture
+python3 host/wavegen.py bpsk  --fc 250e3 --chip-len 150 --code barker7 --amp 0.5 --capture
 python3 host/wavegen.py tone  --fc 200e3 --len 12000 --amp 0.75 --capture
 ```
 
@@ -31,8 +32,11 @@ python3 host/wavegen.py tone  --fc 200e3 --len 12000 --amp 0.75 --capture
 ## Test in simulation
 
 ```
-sim/all        # 8 testbenches; top_tb runs the whole board with wavegen.py's frames
+sim/all        # 8 testbenches
 ```
+
+`sim/top_tb.v` simulates the whole board: it sends the frames in `sim/top_frames.hex`
+(made by `wavegen.py --frames-out`) and checks both captures it gets back.
 
 ## Settings struct (24 bytes, little-endian)
 
