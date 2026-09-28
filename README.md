@@ -1,55 +1,74 @@
-# Waveform generator — finished demo (Tang Nano 9K)
+# Waveform generator: finished reference (Tang Nano 9K)
 
-A working copy of the learning project with every piece filled in. The PC plays the MCU:
-`host/wavegen.py` turns real-world settings into the settings struct, sends it over the USB
-UART, and can capture one pulse back and check it sample-for-sample against the golden model.
+A working copy of the learning project in `../Basic`, with every piece filled in.
+The PC stands in for the MCU: it sends the waveform settings over the USB UART,
+the FPGA generates windowed pulses, and it can capture one pulse and send it back
+to be checked against the Python golden model sample for sample.
 
-Verified on the board on 2026-09-28: chirp up and down, BPSK Barker-13 and Barker-7, and a
-plain tone, each 16,383 captured samples bit-exact.
+Verified on the board on 2026-09-28: chirp up/down, BPSK Barker-13 and Barker-7,
+and a tone at 0.75 amplitude all matched the golden model on all 16,383 samples.
 
 ## Use it
 
 ```
-tn9k load                                   # build and load (SRAM; lost at power-off)
+tn9k load                                   # build + load into the FPGA (volatile)
+
 python3 host/wavegen.py chirp --fc 325e3 --bw 350e3 --len 16000 --capture
 python3 host/wavegen.py chirp --fc 325e3 --bw 350e3 --down --capture
 python3 host/wavegen.py bpsk  --fc 300e3 --chip-len 1000 --code barker13 --capture
-python3 host/wavegen.py bpsk  --fc 250e3 --chip-len 150 --code barker7 --amp 0.5 --capture
-python3 host/wavegen.py tone  --fc 200e3 --len 12000 --capture
+python3 host/wavegen.py tone  --fc 200e3 --len 12000 --amp 0.75 --capture
 ```
 
-- `--capture` records the next pulse, downloads it (~3 s), prints PASS/FAIL and saves a plot
-  in `sim/out/board_capture_<kind>.png`. Without it, the settings are just sent.
-- `--dry-run` prints the frame without sending. `--help` lists every option.
-- Buttons: S1 switches between two built-in presets (chirp 150→500 kHz / BPSK 300 kHz);
-  S2 captures the next pulse (then run `python3 host/capture.py`).
+- `--capture` asks the board for the next pulse, checks it and saves a plot in
+  `sim/out/board_capture_<kind>.png`. Without it, the settings are just sent.
+- Other options: `--amp 0..1`, `--period` (clocks between pulse starts),
+  `--code` (barker2..barker13, or a string like `++-+`), `--dry-run`.
+- On the board: **S1** switches between two built-in presets (chirp 150 -> 500 kHz,
+  BPSK at 300 kHz). **S2** captures the next pulse (listen with `python3 host/capture.py`).
 - LEDs: 0 BPSK, 1 armed, 2 recording, 3 sending, 4 pulse active, 5 PLL locked.
-- DAC pins (`dac_d[7:0]` 25–30, 33, 34; `dac_clk` 35) carry the offset-binary samples.
+- DAC pins (for later): `dac_d[7:0]` on pins 25-30, 33, 34 and `dac_clk` on 35 (3.3 V).
 
-## Settings struct (24 bytes, little-endian) — sent as `A5 01 <struct> <xor>`
+## Test in simulation
 
-| Field | Bytes | Meaning |
+```
+sim/all        # 8 testbenches; top_tb runs the whole board with wavegen.py's frames
+```
+
+## Settings struct (24 bytes, little-endian)
+
+The PC sends `A5 01 <24 bytes> <xor checksum>`, or `A5 02 02` to capture.
+The MCU will later send the same struct over SPI.
+
+| Bytes | Field | Meaning |
 | --- | --- | --- |
-| len | 2 | pulse length, clocks |
-| ftw_start | 4 | starting FTW = f × 2^32 / 50,142,857 |
-| ftw_step | 4 | FTW change per clock (two's complement; 0 = tone) |
-| win_step | 4 | 2^32 / len |
-| code | 2 | phase code, chip i = bit i, 1 = flip |
-| chip_len | 2 | clocks per chip |
-| amp | 2 | amplitude, 4096 = 1.0 |
-| period | 4 | clocks between pulse starts |
+| 0-1 | len | pulse length in clocks (max 65535 = 1.3 ms) |
+| 2-5 | ftw_start | starting frequency: f x 2^32 / 50.142857 MHz |
+| 6-9 | ftw_step | frequency change per clock (two's complement; 0 = tone) |
+| 10-13 | win_step | 2^32 / len (Hann window, one lap per pulse) |
+| 14-15 | code | phase code, bit i = chip i, 1 = flip |
+| 16-17 | chip_len | clocks per chip |
+| 18-19 | amp | amplitude, 4096 = 1.0 |
+| 20-23 | period | clocks between pulse starts |
 
-`A5 02 02` = capture the next pulse. New settings take effect between pulses.
+New settings wait until no pulse is playing (double buffering), so a pulse is never
+changed halfway through.
 
-## Tests
+## What differs from the learning folder
 
-`sim/all` runs every testbench. `sim/top_tb.v` simulates the whole board: it sends the frames
-from `sim/top_frames.hex` (made by `wavegen.py --frames-out`) and checks both captures.
+| File | Change |
+| --- | --- |
+| `pulse_dds.v` | pipeline register before the first multiply |
+| `uart_tx.v` | filled in |
+| `uart_rx.v`, `cmd_rx.v` | new: receive settings and capture commands |
+| `top.v` | settings from the PC, double-buffered, two presets |
+| `capture.v` | header frozen at pulse start (same banked RAM as the learning folder) |
+| `host/wavegen.py` | new: real-world units -> settings struct -> board |
 
-## Toolchain notes (Apycula 0.33)
+## Toolchain notes (found on the real chip)
 
-- `gowin_pack` crashes on the hardware multipliers. The upstream fix (apicula 81b3a9e) is
-  patched into the installed copy, but on the chip the multipliers then come out **unsigned**,
-  so this project builds multiplies from logic: `SYNTH_FLAGS=-nodsp` in `tn9k.conf`.
-- Block RAM in the deep, narrow modes (16K×1, 4K×4) corrupts data on the chip, while 1K×18
-  and 2K×9 work. `capture.v` therefore builds its buffer from 1K banks.
+- **Hardware multipliers (DSP):** Apycula 0.33 crashes packing them; the upstream fix
+  (commit 81b3a9e) is patched into the installed Apycula. They then pack, but compute
+  **unsigned** on the chip, so this project builds with `-nodsp` (`tn9k.conf`).
+- **Block RAM:** the deep, narrow modes (16K x 1, 4K x 4) store samples in the wrong
+  places on the chip. The capture buffer is built from 1K banks instead. The 1K x 18 and
+  2K x 9 modes were checked on the chip with a counter pattern and are fine.
