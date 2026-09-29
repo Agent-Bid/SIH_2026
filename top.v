@@ -1,12 +1,14 @@
 // Tang Nano 9K top: the waveform engine, with its settings sent by the PC over the USB UART
 // (standing in for the MCU until it arrives). host/wavegen.py sends them.
-//   S1: switch between two built-in presets (LFM chirp 150 -> 500 kHz / BPSK Barker-13 at 300 kHz)
+//   S1: step through three built-in presets: LFM chirp 150 -> 500 kHz, geometric sweep
+//       150 -> 500 kHz, BPSK Barker-13 at 300 kHz
 //   S2: capture the next pulse and send it back (host/capture.py or wavegen.py --capture)
-// LEDs (on = 1): 0 BPSK, 1 armed, 2 recording, 3 sending, 4 pulse active, 5 PLL locked
+// LEDs (on = 1): 0 BPSK, 1 armed, 2 recording, 3 sending, 4 pulse active, 5 geometric sweep
 //
-// Settings struct, 24 bytes little-endian (the same layout the MCU will send over SPI):
+// Settings struct, 26 bytes little-endian (the same layout the MCU will send over SPI):
 //   len[15:0]  ftw_start[47:16]  ftw_step[79:48]  win_step[111:80]
-//   code[127:112]  chip_len[143:128]  amp[159:144]  period[191:160]
+//   code[127:112]  chip_len[143:128]  amp[159:144]  period[191:160]  mode[207:192]
+//   mode bit 0 = geometric sweep (ftw_step is then the ratio - 1, x 2^32, applied every 32 clocks)
 module top #(
     parameter CAP_BITS = 14,        // capture 2^14 = 16384 samples
     parameter BAUD_DIV = 435,       // 50.14 MHz / 435 = 115200 baud
@@ -22,10 +24,13 @@ module top #(
     output wire       dac_clk
 );
 
-    // Presets: {period, amp, chip_len, code, win_step, ftw_step, ftw_start, len}
-    localparam [191:0] CHIRP = {32'd25000, 16'd4096, 16'd1000, 16'h0000,
-                                32'd268435, 32'd1874, 32'd12848193, 16'd16000};
-    localparam [191:0] BPSK  = {32'd25000, 16'd4096, 16'd1000, 16'h0A60,
+    // Presets (made with host/wavegen.py --dry-run):
+    //   {mode, period, amp, chip_len, code, win_step, ftw_step, ftw_start, len}
+    localparam [207:0] CHIRP = {16'd0, 32'd25000, 16'd4096, 16'd1000, 16'h0000,
+                                32'd330382, 32'd2306, 32'd12848193, 16'd13000};
+    localparam [207:0] GEO   = {16'd1, 32'd25000, 16'd4096, 16'd1000, 16'h0000,
+                                32'd330382, 32'd12755415, 32'd12848193, 16'd13000};
+    localparam [207:0] BPSK  = {16'd0, 32'd25000, 16'd4096, 16'd1000, 16'h0A60,
                                 32'd330382, 32'd0, 32'd25696386, 16'd13000};
 
     wire clk50, lock;
@@ -46,18 +51,18 @@ module top #(
     // ---- Commands from the PC
     wire [7:0]   rx_data;
     wire         rx_valid;
-    wire [191:0] rx_settings;
+    wire [207:0] rx_settings;
     wire         rx_settings_valid, capture_req;
     uart_rx #(.DIV(BAUD_DIV)) u_rx (.clk(clk50), .rst(rst), .rx(uart_rx),
                                     .data(rx_data), .valid(rx_valid));
-    cmd_rx u_cmd (.clk(clk50), .rst(rst), .rx_data(rx_data), .rx_valid(rx_valid),
+    cmd_rx #(.BYTES(26)) u_cmd (.clk(clk50), .rst(rst), .rx_data(rx_data), .rx_valid(rx_valid),
                   .settings(rx_settings), .settings_valid(rx_settings_valid),
                   .capture_req(capture_req));
 
     // ---- Settings, double-buffered: new ones wait in pending until no pulse is playing
-    reg  [191:0] pending = CHIRP;
-    reg  [191:0] cur     = CHIRP;
-    reg          preset  = 1'b0;
+    reg  [207:0] pending = CHIRP;
+    reg  [207:0] cur     = CHIRP;
+    reg  [1:0]   preset  = 2'd0;
     reg  [31:0]  timer   = 0;
     wire         active;
     wire [31:0]  period = cur[191:160];
@@ -67,8 +72,8 @@ module top #(
         if (rx_settings_valid)
             pending <= rx_settings;
         else if (preset_press) begin
-            pending <= preset ? CHIRP : BPSK;
-            preset  <= ~preset;
+            pending <= (preset == 2'd0) ? GEO : (preset == 2'd1) ? BPSK : CHIRP;
+            preset  <= (preset == 2'd2) ? 2'd0 : preset + 2'd1;
         end
         if (!active && !start)
             cur <= pending;
@@ -82,11 +87,12 @@ module top #(
     wire [15:0] code      = cur[127:112];
     wire [15:0] chip_len  = cur[143:128];
     wire [12:0] amp       = cur[156:144];
+    wire        geo       = cur[192];
 
     // ---- The waveform engine
     wire signed [11:0] out;
     pulse_dds u_eng (.clk(clk50), .rst(rst), .start(start), .len(len),
-                     .ftw_start(ftw_start), .ftw_step(ftw_step), .win_step(win_step),
+                     .ftw_start(ftw_start), .ftw_step(ftw_step), .geo(geo), .win_step(win_step),
                      .code(code), .chip_len(chip_len), .amp(amp),
                      .out(out), .active(active));
 
@@ -98,7 +104,7 @@ module top #(
     // ---- Capture one pulse and send it back
     localparam [15:0] CAP_N = 1 << CAP_BITS;
     wire [231:0] header = {period, {3'b0, amp}, chip_len, code, win_step, ftw_step, ftw_start,
-                           len, CAP_N, 7'b0, (code != 0), 8'h5A, 8'hA5};
+                           len, CAP_N, 6'b0, geo, (code != 0), 8'h5A, 8'hA5};
 
     wire [7:0] tx_data;
     wire       tx_valid, tx_ready;
@@ -111,6 +117,6 @@ module top #(
     uart_tx #(.DIV(BAUD_DIV)) u_tx (.clk(clk50), .rst(rst), .data(tx_data), .valid(tx_valid),
                                     .tx(uart_tx), .ready(tx_ready));
 
-    assign led = ~{lock, active, sending, recording, armed, code != 16'd0};
+    assign led = ~{geo, active, sending, recording, armed, code != 16'd0};
 
 endmodule

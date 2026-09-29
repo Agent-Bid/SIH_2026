@@ -1,8 +1,9 @@
 `timescale 1ns/1ps
 // Board-level test of top.v: a stand-in PLL, a fast UART and a short capture.
 // The "PC" sends the frames made by host/wavegen.py (sim/top_frames.hex):
-//   1. SET a down-chirp 500 -> 150 kHz, then CAPTURE
-//   2. SET BPSK, Barker-7 at 250 kHz, then CAPTURE
+//   1. SET an LFM chirp 150 -> 500 kHz, then CAPTURE
+//   2. SET a geometric sweep 150 -> 500 kHz, then CAPTURE
+//   3. SET BPSK Barker-13 at 250 kHz, then CAPTURE
 // Everything the board sends back is written to a file.
 // Check with: python3 host/capture.py --file sim/out/top_uart.txt
 module top_tb;
@@ -10,7 +11,7 @@ module top_tb;
     localparam BAUD_DIV = 8;
     localparam CAP_BITS = 11;                          // 2048 samples per capture
     localparam BYTES    = 29 + 2 * (1 << CAP_BITS);    // one capture
-    localparam GROUP    = 30;                          // SET frame (27) + CAPTURE frame (3)
+    localparam GROUP    = 32;                          // SET frame (29) + CAPTURE frame (3)
 
     reg        clk  = 0;
     reg        pc_tx = 1;
@@ -26,7 +27,7 @@ module top_tb;
     always #10 clk = ~clk;
 
     // ---- PC -> board
-    reg [7:0] frames [0:2*GROUP-1];
+    reg [7:0] frames [0:3*GROUP-1];
     initial $readmemh("sim/top_frames.hex", frames);
 
     task send_byte(input [7:0] b);
@@ -71,13 +72,17 @@ module top_tb;
         $dumpvars(1, top_tb);
 
         repeat (100) @(posedge clk);
-        $display("PC: set down-chirp + capture");
+        $display("PC: set LFM chirp + capture");
         send_group(0);
         wait (nbytes == BYTES);
 
-        $display("PC: set BPSK Barker-7 + capture");
+        $display("PC: set geometric sweep + capture");
         send_group(1);
         wait (nbytes == 2 * BYTES);
+
+        $display("PC: set BPSK Barker-13 + capture");
+        send_group(2);
+        wait (nbytes == 3 * BYTES);
 
         repeat (100) @(posedge clk);
         $fclose(fd);
@@ -87,7 +92,7 @@ module top_tb;
 
     initial begin
         #200_000_000;
-        $display("TIMEOUT: received only %0d of %0d bytes", nbytes, 2 * BYTES);
+        $display("TIMEOUT: received only %0d of %0d bytes", nbytes, 3 * BYTES);
         $finish;
     end
 

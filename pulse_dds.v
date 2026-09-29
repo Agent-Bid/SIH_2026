@@ -1,4 +1,4 @@
-// Windowed pulse: swept, phase-coded tone * Hann window * amp, for len clocks after each start.
+// Windowed pulse: swept (LFM or geometric), phase-coded tone * Hann window * amp, for len clocks after each start.
 module pulse_dds (
     input  wire               clk,
     input  wire               rst,
@@ -6,6 +6,7 @@ module pulse_dds (
     input  wire        [15:0] len,
     input  wire        [31:0] ftw_start,
     input  wire        [31:0] ftw_step,   // 0 = plain tone
+    input  wire               geo,        // 1 = geometric sweep (see sweep.v)
     input  wire        [31:0] win_step,   // 2^32 / len
     input  wire        [15:0] code,
     input  wire        [15:0] chip_len,
@@ -20,7 +21,7 @@ module pulse_dds (
 
     wire [31:0] ftw_now;
 
-    sweep u_sweep (.clk(clk), .rst(run_rst), .start(ftw_start), .step(ftw_step), .ftw(ftw_now));
+    sweep u_sweep (.clk(clk), .rst(run_rst), .geo(geo), .start(ftw_start), .step(ftw_step), .ftw(ftw_now));
 
     wire flip;
     phase_code u_phase (.clk(clk), .rst(run_rst), .code(code), .chip_len(chip_len), .flip(flip));

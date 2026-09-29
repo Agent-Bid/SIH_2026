@@ -1,14 +1,14 @@
 // Command frames from the PC (standing in for the MCU):
 //   A5, cmd, payload..., checksum      checksum = XOR of cmd and every payload byte
-//   cmd 01: SET, 24-byte payload = the settings struct (little-endian fields, see top.v)
+//   cmd 01: SET, BYTES-byte payload = the settings struct (little-endian fields, see top.v)
 //   cmd 02: CAPTURE, no payload        = capture the next pulse and send it back
 // A frame that stops arriving for TIMEOUT clocks is dropped.
-module cmd_rx #(parameter TIMEOUT = 50000) (
+module cmd_rx #(parameter BYTES = 26, parameter TIMEOUT = 50000) (
     input  wire         clk,
     input  wire         rst,
     input  wire [7:0]   rx_data,
     input  wire         rx_valid,
-    output reg  [191:0] settings,
+    output reg  [BYTES*8-1:0] settings,
     output reg          settings_valid,   // one clock: a good SET frame arrived
     output reg          capture_req       // one clock: a good CAPTURE frame arrived
 );
@@ -20,7 +20,7 @@ module cmd_rx #(parameter TIMEOUT = 50000) (
     reg [7:0]   cmd;
     reg [7:0]   sum;
     reg [4:0]   n;
-    reg [191:0] buffer;
+    reg [BYTES*8-1:0] buffer;
     reg [15:0]  idle;
 
     always @(posedge clk) begin
@@ -50,10 +50,10 @@ module cmd_rx #(parameter TIMEOUT = 50000) (
                     state <= (rx_data == SET) ? PAYLOAD : (rx_data == CAPTURE) ? CHECK : SYNC;
                 end
                 PAYLOAD: begin
-                    buffer <= {rx_data, buffer[191:8]};      // byte 0 ends up in bits [7:0]
+                    buffer <= {rx_data, buffer[BYTES*8-1:8]};      // byte 0 ends up in bits [7:0]
                     sum    <= sum ^ rx_data;
                     n      <= n + 1;
-                    if (n == 23)
+                    if (n == BYTES - 1)
                         state <= CHECK;
                 end
                 CHECK: begin

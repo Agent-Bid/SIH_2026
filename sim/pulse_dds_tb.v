@@ -18,7 +18,7 @@ module pulse_dds_tb;
     wire               active;
 
     pulse_dds dut (.clk(clk), .rst(rst), .start(start), .len(LEN),
-                   .ftw_start(FTW), .ftw_step(32'd0),
+                   .ftw_start(FTW), .ftw_step(32'd0), .geo(1'b0),
                    .code(16'd0), .chip_len(16'd1),
                    .win_step(WIN_STEP), .amp(amp), .out(out), .active(active));
 

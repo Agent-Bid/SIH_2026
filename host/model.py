@@ -31,13 +31,14 @@ def read_log(path):
     return int(hdr["len"]), int(hdr["win_step"]), inputs, out, act
 
 
-def golden(inputs, length, win_step, window=None):
+def golden(inputs, length, win_step, window=None, geo=False):
     """inputs: one (start, ftw_start, ftw_step, amp, code, chip_len) per tick.
-    Returns (out, active)."""
+    geo: geometric sweep instead of LFM. Returns (out, active)."""
     sine = sine_table()
     window = hann_table() if window is None else window
     active = count = ftw = phase = winph = tone = win = tone_r = win_r = shaped = out = 0
     tick_in_chip = chip = 0
+    geo_n = geo_acc = 0
     outs, acts = [], []
     for start, ftw_start, ftw_step, amp, code, chip_len in inputs:
         run_rst = not active
@@ -49,7 +50,18 @@ def golden(inputs, length, win_step, window=None):
             n_count = (count + 1) % 2**16
         else:
             n_active, n_count = active, count
-        n_ftw = ftw_start if run_rst else (ftw + ftw_step) % 2**32
+        n_geo_n, n_geo_acc = geo_n, geo_acc
+        if run_rst:
+            n_ftw, n_geo_n, n_geo_acc = ftw_start, 0, 0
+        elif not geo:
+            n_ftw = (ftw + ftw_step) % 2**32
+        else:                                       # shift-and-add: one bit of step per tick
+            total = geo_acc + (ftw if (ftw_step >> geo_n) & 1 else 0)
+            n_geo_n = (geo_n + 1) % 32
+            if geo_n == 31:
+                n_ftw, n_geo_acc = (ftw + (total >> 1)) % 2**32, 0
+            else:
+                n_ftw, n_geo_acc = ftw, total >> 1
         n_phase = 0 if run_rst else (phase + ftw) % 2**32
         n_winph = 0 if run_rst else (winph + win_step) % 2**32
         if run_rst:
@@ -65,10 +77,21 @@ def golden(inputs, length, win_step, window=None):
         n_out = (shaped * amp) >> 12
         active, count, ftw, phase, winph = n_active, n_count, n_ftw, n_phase, n_winph
         tick_in_chip, chip = n_tick, n_chip
+        geo_n, geo_acc = n_geo_n, n_geo_acc
         tone, win, tone_r, win_r, shaped, out = n_tone, n_win, n_tone_r, n_win_r, n_shaped, n_out
         outs.append(out)
         acts.append(active)
     return np.array(outs), np.array(acts)
+
+
+def geo_ftw(ftw_start, ftw_step, length):
+    """The ftw a geometric sweep has reached after each clock of a pulse (for plots)."""
+    track, ftw = [], ftw_start
+    for k in range(length):
+        track.append(ftw)
+        if k % 32 == 31:
+            ftw = (ftw + ftw * ftw_step // 2**32) % 2**32
+    return np.array(track)
 
 
 def pulses(act):

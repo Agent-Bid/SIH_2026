@@ -17,7 +17,7 @@ module bpsk_tb;
     wire               active;
 
     pulse_dds dut (.clk(clk), .rst(rst), .start(start), .len(LEN),
-                   .ftw_start(F5MHZ), .ftw_step(32'd0),
+                   .ftw_start(F5MHZ), .ftw_step(32'd0), .geo(1'b0),
                    .code(BARKER13), .chip_len(CHIP_LEN),
                    .win_step(WIN_STEP), .amp(amp), .out(out), .active(active));
 
