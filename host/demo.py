@@ -189,11 +189,9 @@ def main():
         reader.start()
         time.sleep(0.5)
     except serial.SerialException:
-        print(f"no ESP32 on {a.esp}: the water conditions are worked out from each packet's number "
-              "(host/water_sim.py)")
+        pass                                               # conditions from the packet numbers instead
 
     fpga = open_board(a.fpga, timeout=1)
-    print(f"capturing {PINGS} consecutive pings from the FPGA...")
     caps = collect(fpga)
     if reader:
         time.sleep(0.5)                                    # the last PING lines
@@ -206,7 +204,6 @@ def main():
             if f["seq"] in missing:
                 pings[f["seq"]] = from_header(f, sim[f["seq"]])
 
-    print("checking every ping against the golden model...")
     with ProcessPoolExecutor() as pool:
         oks = list(pool.map(verify, [f for f, _ in caps], [s for _, s in caps]))
     period = caps[0][0]["period"] / F_CLK
