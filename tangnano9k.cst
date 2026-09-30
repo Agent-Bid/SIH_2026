@@ -43,3 +43,9 @@ IO_PORT "spi_cs_n" PULL_MODE=UP;
 IO_LOC  "spi_mosi" 37;
 IO_LOC  "spi_sck"  38;
 IO_PORT "spi_sck"  PULL_MODE=DOWN;
+
+// Oscilloscope outputs (bank 2 = 3.3 V): the waveform as a 1-bit sigma-delta stream (put a 1 kOhm
+// resistor in series and 100 pF to ground, probe across the capacitor), and a trigger that is high
+// during each pulse.
+IO_LOC "scope_sd"   40;
+IO_LOC "scope_trig" 41;

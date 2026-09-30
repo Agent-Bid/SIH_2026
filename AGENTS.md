@@ -38,15 +38,15 @@ An underwater sonar transmitter that adapts its waveform to the water conditions
 
 | Part | State |
 |---|---|
-| FPGA design | All 9 simulations pass (`sim/all`). Built: 44 % LUT, 45 % DFF, 18/26 BSRAM, 65 MHz (needs 50.14). |
-| FPGA on the board, PC path (UART) | **Verified**: chirp, geometric, BPSK and tone captured bit-exact against the golden model (16,383 samples each), with packet v3. |
+| FPGA design | All 10 simulations pass (`sim/all`). Built: 45 % LUT, 46 % DFF, 18/26 BSRAM, 71.75 MHz (needs 50.14). **Written to the FPGA's flash (2026-09-30)**: it starts on power-up. |
+| FPGA on the board, PC path (UART) | **Verified (again 2026-09-30, with the scope outputs and the 2-clock `scale`)**: chirp, geometric, BPSK and tone captured bit-exact against the golden model (16,383 samples each), with packet v3. |
 | ESP32 → FPGA over SPI | **Verified on the boards (2026-09-30)**: 10 good packets/s, 0 bad; the FPGA plays the ESP32's choice bit-exact (H-S chirp at 300 m; M-S geometric sweep after `R 600` + `M geo`). Framed **without CS** (see section 5): the CS wire (GPIO14 → pin 36) never carried a clean signal. |
 | ESP32 firmware v3 + ML | 34/34 host tests pass; **flashed and running** (native USB build, `CDCOnBoot=cdc`); the status line shows `ML` decisions. |
 | Wiring ESP32 ↔ FPGA | Done (pin table in section 6). SCK, MOSI verified with an edge-counting probe; CS picks up only noise (cause not found: ESP32 pin, wire or FPGA pin). |
-| DAC | Not chosen / not connected. The FPGA already drives `dac_d[7:0]` and `dac_clk`. |
+| DAC | Not chosen / not connected. The FPGA already drives `dac_d[7:0]` and `dac_clk`. For an oscilloscope without a DAC: `scope_sd` (pin 40, 1-bit sigma-delta, needs 1 kΩ + 100 pF) and `scope_trig` (pin 41), see section 6. Not yet looked at on a scope. |
 | Sensors | No potentiometers wired: the ESP32's ADC inputs float, so its readings are noise. |
 | ML model | Built (2026-09-30): two networks in `MCU /SIH/ml_model.h` (profile 6-48-48-6, amplitude 12-48-48-1), `USE_ML_MODEL 1`. Profile agrees with the physics on 99.2–99.4 %, 0.5 % overridden; amplitude within 1.8 % (median), 1.6–3.4 % extra energy. **Running on the ESP32.** |
-| Git | The SPI / packet-v3 work is not committed yet, and `MCU /` is untracked. |
+| Git | Committed. |
 
 A board incident on 2026-09-29: with the ESP32 wired in, the FPGA's UART went silent and
 JTAG read a wrong IDCODE (`0x0100581B`), so bitstreams would not load. A power cycle cleared
@@ -68,7 +68,8 @@ Run everything from this folder (the project root): scripts and `$readmemh` use 
 | `sweep.v` | Frequency sweep: LFM (add) or geometric (multiply, shift-and-add) on a 48-bit register |
 | `phase_code.v` | BPSK chip counter: `flip = code[chip]` |
 | `dds.v`, `phase_acc.v` | Phase accumulator + 1024-entry sine table (with a phase offset input for BPSK) |
-| `scale.v` | Fixed-point multiply: `out = in × factor / 4096` |
+| `scale.v` | Fixed-point multiply: `out = in × factor / 4096`, 2 clocks (split into two small products) |
+| `sigma_delta.v` | 1-bit DAC (first-order sigma-delta) of the waveform, for an oscilloscope |
 | `spi_rx.v` | SPI slave (mode 0) that collects one packet, framed by CS or (as used now) by the pause after each burst |
 | `pkt_check.v` | Checks sync, version and CRC-8 of a packet, one byte per clock |
 | `uart_rx.v`, `uart_tx.v`, `cmd_rx.v` | USB UART (115200 8N1) and its command frames |
@@ -110,6 +111,7 @@ start ─► pulse_ctrl ─► active (len clocks);  run_rst = rst | ~active hol
           window phase += win_step; win = hann[win_phase[31:22]]                              (13-bit, 0..4096)
           pipeline register (tone_r, win_r) ─► scale (× window) ─► scale (× amp) ─► out (12-bit signed)
 top: dac_d = {~out[11], out[10:4]} (offset binary, top 8 bits); dac_clk = ~clk (DAC latches mid-sample)
+     scope_sd = sigma_delta(out); scope_trig = active
 ```
 - **LFM**: the sweep register holds FTW × 2¹⁶ (48 bits); every clock it adds the signed 32-bit
   `ftw_step` (FTW per clock × 2¹⁶). The fraction bits let long, narrow chirps sweep exactly.
@@ -120,7 +122,9 @@ top: dac_d = {~out[11], out[10:4]} (offset binary, top 8 bits); dac_clk = ~clk (
   Barker-13 = `0x0A60` (chips `+ + + + + - - + + - + - +`, bit i = chip i, 1 = flip).
 - **Window**: a second phase accumulator makes exactly one lap per pulse (`win_step = 2³² / len`).
 - The pipeline register before the first multiply is needed for timing (multipliers are built
-  from LUTs, see section 7).
+  from LUTs, see section 7). Each `scale` takes 2 clocks: `factor` is split into its low 7 and
+  high 6 bits, both partial products are registered, then added and shifted. `host/model.py`
+  mirrors this delay exactly.
 
 ### Limits
 | Quantity | Limit |
@@ -216,7 +220,17 @@ there. Pins 59–62 are the on-board flash.
 | `spi_mosi` | 37 | ESP32 GPIO12 |
 | `spi_sck` | 38 (pull-down) | ESP32 GPIO13 |
 | (unused) | 39 | ESP32 GPIO11 (MISO) |
+| `scope_sd` | 40 | oscilloscope: 1 kΩ in series, 100 pF to GND, probe across the capacitor |
+| `scope_trig` | 41 | oscilloscope trigger: high during each pulse |
 | GND | GND | ESP32 GND — required |
+
+**Oscilloscope without a DAC**: `scope_sd` is the waveform as a 1-bit stream at 50 MHz (a
+first-order sigma-delta: the share of 1s follows the sample). Through 1 kΩ + 100 pF (cut-off
+≈ 1.6 MHz) it becomes the analog waveform, window and amplitude included (simulated ripple
+≈ 11 % of the amplitude). Unfiltered, it looks like a band of fast pulses; a DSO's averaging
+(triggered on `scope_trig`) may still show the shape. With no parts at all, `dac_d[7]`
+(pin 34, the sign bit) is a square wave at the instantaneous frequency: it shows the sweep and
+the BPSK phase jumps, but not the window or the amplitude.
 
 **LEDs** (lit = true): 0 BPSK, 1 capture armed, 2 recording or sending, 3 toggles on every good
 SPI packet, 4 pulse active, 5 geometric sweep.
@@ -239,7 +253,7 @@ plugged in, the numbers can shift: check with `ls /dev/ttyUSB* /dev/ttyACM*`, pa
 | nextpnr-himbaechel | 0.11.1 (Gowin) |
 | Apycula (`gowin_pack`) | 0.33 in `~/.local/share/apycula-venv`, **patched** with upstream commit 81b3a9e (undo: `pip install --force-reinstall apycula==0.33` in that venv) |
 | openFPGALoader | loads SRAM / flash over the on-board JTAG |
-| `tn9k` | `~/.local/bin/tn9k`: `tn9k build`, `tn9k load` (SRAM, lost at power-off), `tn9k flash`, `tn9k clean`. Compiles every `.v` in the folder, top = `top`, reads `tn9k.conf` (`FREQ`, `SYNTH_FLAGS`, `SRC`) |
+| `tn9k` | `~/.local/bin/tn9k`: `tn9k build`, `tn9k load` (SRAM, lost at power-off), `tn9k flash`, `tn9k clean` (`openFPGALoader -b tangnano9k -f build/top.fs` writes flash directly). Compiles every `.v` in the folder, top = `top`, reads `tn9k.conf` (`FREQ`, `SYNTH_FLAGS`, `SRC`) |
 | iverilog / vvp, GTKWave | simulation (`sim/run <tb> -w` opens GTKWave) |
 | Python 3 | numpy, scipy, matplotlib, pyserial |
 | arduino-cli | 1.4.1, core `esp32:esp32` 3.3.7; esptool v5.1.0 |
@@ -250,6 +264,10 @@ Findings on the real chip — **do not undo these**:
   `-nodsp`; all multipliers are LUT-based, hence the pipeline register in `pulse_dds.v`.
 - **Block RAM**: the deep, narrow modes (16K × 1, 4K × 4) store data at wrong addresses on the
   chip. Only 1K × 18 and 2K × 9 were verified. `capture.v` therefore uses 1024-deep banks.
+- **The timing report can pass while the chip fails.** With the sigma-delta added, a single-clock
+  12 × 13-bit LUT multiply in `scale.v` gave wrong products on a few samples per capture, though
+  nextpnr reported slack. Splitting it into two registered partial products (2 clocks) fixed
+  it (5/5 captures bit-exact). Keep LUT multipliers small and registered.
 - The router prints `Failed to route net 'clk50' ... using dedicated routing` (the inverted
   clock to `dac_clk`); it is expected and harmless so far.
 
@@ -342,7 +360,7 @@ physics checks it.
 ## 9. Build, test, run
 
 ```
-sim/all                                  # all 9 testbenches + checkers, prints ALL PASS
+sim/all                                  # all 10 testbenches + checkers, prints ALL PASS
 sim/run top_tb -w                        # one testbench, then GTKWave
 tn9k load                                # build + load the FPGA (SRAM)
 python3 host/wavegen.py geo --fc 325e3 --bw 350e3 --capture   # PC sets a waveform, captures, checks
@@ -362,6 +380,7 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
 | `chirp_tb` | LFM up and down, 3 ↔ 7 MHz, bit-exact + measured sweep |
 | `geo_tb` | geometric 2 → 8 MHz, bit-exact + measured: exactly two octaves |
 | `bpsk_tb` | Barker-13, bit-exact + code read back from the samples |
+| `sigma_delta_tb` | scope output: bit-exact sigma-delta of a chirp; after a simulated 1 kΩ + 100 pF it follows the waveform (ripple < 15 %) |
 | `top_tb` | whole board: UART chirp, SPI packet with bad CRC (rejected) + good geometric packet, UART BPSK; three captures checked by `capture.py` |
 
 ---
@@ -372,7 +391,8 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
    burst). Finding out why GPIO14 → pin 36 carries only noise (ESP32 pin, jumper or FPGA pin; a
    GPIO14 toggle test with the pin probe would tell) is optional.
 2. **Choose the DAC**: it must take 8-bit parallel data at 50 MS/s (or the FPGA must slow its
-   output rate), and its latch edge must match `dac_clk`.
+   output rate), and its latch edge must match `dac_clk`. Until then, look at the waveforms on
+   an oscilloscope through `scope_sd` (section 6).
 3. **Automatic choice between LFM, geometric and BPSK**: the physics scores waveforms by pulse
    energy only, so it cannot tell them apart. It needs a relative-speed (Doppler) input:
    geometric sweeps tolerate motion, BPSK needs a nearly still scene (≈ 0.6 m/s at 300 kHz
@@ -391,8 +411,6 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
     (hydrophone → amp → log detector → ESP32 ADC) and log it with the inputs and the choice.
     Later: a speed (Doppler) estimate from echoes would also enable automatic LFM / geometric /
     BPSK choice.
-11. Commit the current work (SPI receiver, packet v3, ML, `MCU /`), and write the FPGA
-    bitstream to flash (`tn9k flash`) so it survives power-off.
 
 ---
 

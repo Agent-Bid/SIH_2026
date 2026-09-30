@@ -25,12 +25,12 @@ module top_tb;
     wire [5:0] led;
     wire       uart_tx;
     wire [7:0] dac_d;
-    wire       dac_clk;
+    wire       dac_clk, scope_sd, scope_trig;
 
     top #(.CAP_BITS(CAP_BITS), .BAUD_DIV(BAUD_DIV), .BTN_BITS(3)) dut (
         .clk(clk), .btn1(1'b1), .btn2(1'b1), .uart_rx(pc_tx),
         .spi_sck(sck), .spi_mosi(mosi), .spi_cs_n(cs_n), .led(led),
-        .uart_tx(uart_tx), .dac_d(dac_d), .dac_clk(dac_clk));
+        .uart_tx(uart_tx), .dac_d(dac_d), .dac_clk(dac_clk), .scope_sd(scope_sd), .scope_trig(scope_trig));
 
     always #10 clk = ~clk;
 

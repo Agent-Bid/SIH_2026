@@ -25,7 +25,9 @@ module top #(
     output wire [5:0] led,
     output wire       uart_tx,
     output reg  [7:0] dac_d,
-    output wire       dac_clk
+    output wire       dac_clk,
+    output wire       scope_sd,     // 1-bit DAC of the waveform: RC low-pass it for an oscilloscope
+    output wire       scope_trig    // high during each pulse: trigger the oscilloscope on its rising edge
 );
 
     localparam PKT_BYTES = 57;
@@ -154,6 +156,10 @@ module top #(
     always @(posedge clk50)
         dac_d <= {~out[11], out[10:4]};
     assign dac_clk = ~clk50;
+
+    // Oscilloscope outputs (no DAC needed): the waveform as a 1-bit sigma-delta stream, and a trigger
+    sigma_delta u_sd (.clk(clk50), .rst(rst), .in(out), .out(scope_sd));
+    assign scope_trig = active;
 
     // ---- Capture one pulse and send it back. Header, 37 bytes (host/capture.py):
     //   A5 5A, mod, N, len, ftw_start, ftw_step, win_step, code, chip_len, amp, period,

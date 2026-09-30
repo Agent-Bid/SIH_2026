@@ -42,7 +42,7 @@ module pulse_dds_tb;
         fd = $fopen("sim/out/pulse_samples.txt", "w");
         $fdisplay(fd, "# len=%0d win_step=%0d", LEN, WIN_STEP);
 
-        repeat (5) @(negedge clk);        // reset
+        repeat (10) @(negedge clk);       // reset
         rst = 0;
 
         repeat (50)  tick(0);             // quiet

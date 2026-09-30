@@ -8,12 +8,13 @@ declare -A checker=(
     [pulse_dds_tb]=host/check_pulse.py
     [chirp_tb]=host/check_chirp.py
     [geo_tb]=host/check_geo.py
+    [sigma_delta_tb]=host/check_sigma_delta.py
     [bpsk_tb]=host/check_bpsk.py
     [top_tb]="host/capture.py --file sim/out/top_uart.txt"
 )
 
 fails=0
-for tb in phase_acc_tb pulse_ctrl_tb phase_code_tb dds_tb pulse_dds_tb chirp_tb geo_tb bpsk_tb top_tb; do
+for tb in phase_acc_tb pulse_ctrl_tb phase_code_tb dds_tb pulse_dds_tb chirp_tb geo_tb bpsk_tb sigma_delta_tb top_tb; do
     [[ -f sim/$tb.v ]] || continue
     if ! out=$(sim/run "$tb" 2>&1); then
         result="FAIL (did not compile: $(grep -m1 -iE 'error' <<<"$out"))"

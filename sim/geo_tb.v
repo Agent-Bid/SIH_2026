@@ -38,7 +38,7 @@ module geo_tb;
         fd = $fopen("sim/out/geo_samples.txt", "w");
         $fdisplay(fd, "# len=%0d win_step=%0d", LEN, WIN_STEP);
 
-        repeat (5) @(negedge clk);
+        repeat (10) @(negedge clk);             // long enough to fill the pipeline with zeros
         rst = 0;
 
         repeat (50) tick(0);

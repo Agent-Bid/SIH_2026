@@ -34,13 +34,16 @@ python3 host/capture.py --request                                # capture what 
   `M bpsk`, `M lfm`, `M cw` or `M auto` picks the modulation, `R 450` the target range.
 - On the board: **S1** steps through three presets (chirp, geometric, BPSK), **S2** captures
   the next pulse (listen with `python3 host/capture.py`).
+- **Oscilloscope** (no DAC needed): pin 40 → 1 kΩ → probe point, 100 pF from the probe point
+  to GND; trigger on pin 41 (high during each pulse). Without any parts, pin 34 shows a square
+  wave at the waveform's frequency (sweep and BPSK phase jumps visible, window not).
 - LEDs: 0 BPSK, 1 armed, 2 recording/sending, 3 blinks per good SPI packet, 4 pulse active,
   5 geometric.
 
 ## Test in simulation
 
 ```
-sim/all        # 9 testbenches, ALL PASS
+sim/all        # 10 testbenches, ALL PASS
 ```
 
 `sim/top_tb.v` simulates the whole board: settings over the UART, a pretend ESP32 on SPI
@@ -57,3 +60,6 @@ by `host/capture.py`.
   chirp at 300 m, then an M-S geometric sweep after `R 600` and `M geo`. Packets are framed by
   the pause after each burst instead of CS (the CS wire does not work on these boards; see
   `AGENTS.md`).
+- 2026-09-30: with the oscilloscope outputs added and `scale` split into two clocks (the
+  single-clock multiply failed on the chip), ESP32 and PC captures were all bit-exact. This
+  build is in the FPGA's flash.

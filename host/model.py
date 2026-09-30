@@ -37,6 +37,7 @@ def golden(inputs, length, win_step, window=None, geo=False):
     sine = sine_table()
     window = hann_table() if window is None else window
     active = count = ftw = phase = winph = tone = win = tone_r = win_r = shaped = out = 0
+    pair1 = pair2 = (0, 0)              # scale.v's first clock: the operands, one clock late
     tick_in_chip = chip = 0
     geo_n = geo_acc = acc = 0
     outs, acts = [], []
@@ -76,12 +77,15 @@ def golden(inputs, length, win_step, window=None, geo=False):
         n_tone = sine[((phase + (flip << 31)) % 2**32) >> 22]
         n_win = window[winph >> 22]
         n_tone_r, n_win_r = tone, win               # pipeline register before the multiply
-        n_shaped = (tone_r * win_r) >> 12
-        n_out = (shaped * amp) >> 12
+        # scale.v takes two clocks: products of the operands one clock late, then the shift
+        n_pair1, n_pair2 = (tone_r, win_r), (shaped, amp)
+        n_shaped = (pair1[0] * pair1[1]) >> 12
+        n_out = (pair2[0] * pair2[1]) >> 12
         active, count, acc, phase, winph = n_active, n_count, n_acc, n_phase, n_winph
         tick_in_chip, chip = n_tick, n_chip
         geo_n, geo_acc = n_geo_n, n_geo_acc
         tone, win, tone_r, win_r, shaped, out = n_tone, n_win, n_tone_r, n_win_r, n_shaped, n_out
+        pair1, pair2 = n_pair1, n_pair2
         outs.append(out)
         acts.append(active)
     return np.array(outs), np.array(acts)
