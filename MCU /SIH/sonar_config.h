@@ -36,7 +36,8 @@
 
 // Time between pulse starts. One-way link: this minimum. Echo mode: at least
 // pulse + round trip (2 x range / c), so a pulse never starts before the echo is back.
-#define PING_PERIOD_MIN_S      0.1f                    // [ASSUMPTION] 10 pings per second at most
+#define PING_RATE_HZ           6                       // pings (and decisions) per second
+#define PING_PERIOD_MIN_S      0.16666667f             // 1 / PING_RATE_HZ
 
 /* ========================================================================
    2. WATER / CHANNEL MODEL SETTINGS (things we do NOT have a sensor for)
@@ -87,6 +88,27 @@
 #define DETAIL_FREE_ENERGY_FRAC  0.01f      // [ASSUMPTION] up to 1 % of the ping's budget always counts as affordable
 
 /* ========================================================================
+   4c. MODULATION FROM MOTION (Doppler)   (decide with the team!)
+   ------------------------------------------------------------------------
+   Motion between sonar and target shifts every frequency by
+       fd = k x speed / c x fc          (k = 1 one-way, 2 in echo mode)
+   so over one pulse of length T the phase drifts fd x T cycles.
+     BPSK       needs almost no drift: the code only matches while the phase
+                holds. When still it is the cleanest: no range-Doppler
+                coupling and sidelobes at 1/13.
+     LFM        tolerates some drift; it shifts the range estimate slightly.
+     GEOMETRIC  tolerates the most: a frequency shift only slides the sweep
+                in time, so the pulse still matches.
+   "M auto" takes the least tolerant modulation that the drift over the
+   chosen profile's pulse allows: BPSK, then LFM, then geometric.
+   ======================================================================== */
+#define SPEED_MIN_MS             0.0f       // relative speed (magnitude), m/s
+#define SPEED_MAX_MS             10.0f
+#define DEFAULT_SPEED_MS         0.0f
+#define DOPPLER_BPSK_MAX_CYCLES  0.25f      // [ASSUMPTION] BPSK while fd x T <= this
+#define DOPPLER_LFM_MAX_CYCLES   1.0f       // [ASSUMPTION] LFM while fd x T <= this, geometric beyond
+
+/* ========================================================================
    5. BATTERY  ->  ENERGY ALLOWED PER PING
    ======================================================================== */
 #define ENERGY_PER_PING_MAX_J  0.4f        // [ASSUMPTION] electrical energy allowed per ping at 100 % SOC
@@ -131,8 +153,8 @@
      X-tier 120 kHz -> ~0.6 cm   H-tier 60 kHz -> ~1.3 cm
      M-tier  40 kHz -> ~1.9 cm   L-tier 40 kHz -> ~1.9 cm
    ======================================================================== */
-// The profile table below is all LFM; the operator can switch every profile to another
-// modulation with the serial command  M lfm | geo | bpsk | cw | auto  (auto = the table's).
+// The table's modulation (LFM) is only a default: "M auto" picks it from the motion (section 4c),
+// and the operator can force one with the serial command  M lfm | geo | bpsk | cw.
 //   GEOMETRIC: the frequency is multiplied by the same ratio every step (fc-bw/2 -> fc+bw/2);
 //              tolerant of motion (Doppler).
 //   BPSK:      a tone at fc, phase-flipped by the Barker-13 code; 13 chips fill the pulse.

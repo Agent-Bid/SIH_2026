@@ -4,7 +4,8 @@ This file describes the whole project: what it does, how the pieces fit, how to 
 test and run it, what has been verified, and what is still open. Read it before changing
 anything. Keep it up to date when you change the design (see "Rules for changes" at the end).
 
-Last updated: 2026-09-30 (ESP32 → FPGA link verified end to end on the boards; SPI framed without CS).
+Last updated: 2026-09-30 (simulated water conditions, 6 pings/s, Doppler-based modulation with a third
+network, streamed captures at 3 Mbaud, `host/demo.py` verified on the boards).
 
 ---
 
@@ -13,24 +14,28 @@ Last updated: 2026-09-30 (ESP32 → FPGA link verified end to end on the boards;
 An underwater sonar transmitter that adapts its waveform to the water conditions.
 
 ```
- 5 sensors ─► ESP32-S3 ────────────────── SPI (57-byte packet, 10 Hz) ──► Tang Nano 9K FPGA ──► 8-bit DAC ──► amplifier ──► transducer
- (pots for    physics model picks a                                        generates the pulse
-  now)        waveform profile and power                                   sample by sample at 50.14 MHz
+ conditions ─► ESP32-S3 ───────────────── SPI (57-byte packet per ping) ──► Tang Nano 9K FPGA ──► 8-bit DAC ──► amplifier ──► transducer
+ (simulated    neural networks pick the                                     generates the pulse
+  for now)     waveform, physics checks it                                  sample by sample at 50.14 MHz
                                                      PC (USB UART) ──────►  (can stand in for the ESP32,
-                                                                   ◄──────   and read captured pulses back)
+                                                                   ◄──────   and streams captured pulses back)
 ```
 
-- **ESP32-S3 (`MCU /SIH/`)**: reads temperature, salinity, depth, turbidity and battery, runs
-  an underwater acoustics model, picks one of 12 chirp profiles (100–500 kHz, 1/5/20 ms), sets
-  the drive amplitude just high enough to close the link, converts everything into the FPGA's
-  own units and sends a packet over SPI ten times a second.
+- **ESP32-S3 (`MCU /SIH/`)**: takes temperature, salinity, depth, turbidity, battery, target
+  range and relative speed (by default from a built-in simulation of changing water
+  conditions, `water_sim.h`), runs an underwater acoustics model and three small neural
+  networks, and for every ping picks a profile (100–500 kHz, 1/5/20 ms), the drive amplitude
+  (just enough to close the link) and the modulation (BPSK, LFM or geometric, from the Doppler
+  drift the motion causes); the physics checks each pick. It converts everything into the
+  FPGA's own units and sends a packet over SPI, 6 pings a second.
 - **FPGA (the Verilog in this folder)**: turns the packet into windowed pulses. Four
   modulations: CW tone, LFM chirp, geometric (exponential) sweep, and BPSK with the Barker-13
   code. Every pulse gets a Hann window (to keep its spectrum tight) and an amplitude.
   It drives an 8-bit parallel DAC.
 - **PC (`host/`)**: can send the same packet over the Tang Nano's USB UART (stands in for the
-  ESP32), and can ask the FPGA to capture a pulse and send it back; the samples are checked
-  against a bit-exact Python golden model.
+  ESP32), and can ask the FPGA to capture one pulse or every pulse and send it back; the samples
+  are checked against a bit-exact Python golden model. `host/demo.py` shows one second of the
+  running system: 6 pings on one graph with the conditions and choices behind each.
 
 ---
 
@@ -38,14 +43,15 @@ An underwater sonar transmitter that adapts its waveform to the water conditions
 
 | Part | State |
 |---|---|
-| FPGA design | All 10 simulations pass (`sim/all`). Built: 45 % LUT, 46 % DFF, 18/26 BSRAM, 71.75 MHz (needs 50.14). **Written to the FPGA's flash (2026-09-30)**: it starts on power-up. |
-| FPGA on the board, PC path (UART) | **Verified (again 2026-09-30, with the scope outputs and the 2-clock `scale`)**: chirp, geometric, BPSK and tone captured bit-exact against the golden model (16,383 samples each), with packet v3. |
-| ESP32 → FPGA over SPI | **Verified on the boards (2026-09-30)**: 10 good packets/s, 0 bad; the FPGA plays the ESP32's choice bit-exact (H-S chirp at 300 m; M-S geometric sweep after `R 600` + `M geo`). Framed **without CS** (see section 5): the CS wire (GPIO14 → pin 36) never carried a clean signal. |
-| ESP32 firmware v3 + ML | 34/34 host tests pass; **flashed and running** (native USB build, `CDCOnBoot=cdc`); the status line shows `ML` decisions. |
+| FPGA design | All 11 simulations pass (`sim/all`). Built: 49 % DFF, 18/26 BSRAM, 68 MHz (needs 50.14). **Written to the FPGA's flash (2026-09-30)**: it starts on power-up. |
+| FPGA on the board, PC path (UART, 3 Mbaud) | **Verified**: chirp, geometric, BPSK and tone captured bit-exact against the golden model (16,383 samples each). |
+| ESP32 → FPGA over SPI | **Verified on the boards (2026-09-30)**: one new packet per ping, 6 per second, 0 bad; framed **without CS** (see section 5): the CS wire (GPIO14 → pin 36) never carried a clean signal. |
+| Whole system, `host/demo.py` | **Verified (2026-09-30)**: 6 consecutive pings (streamed captures, whole pulses), each a new ESP32 decision (packet numbers one apart), all bit-exact; the conditions recomputed on the PC match the ESP32's log. |
+| ESP32 firmware v3 + ML | 43/43 host tests pass; **flashed and running** (native USB build, `CDCOnBoot=cdc`); starts in automatic mode (simulated conditions) at power-on, with or without a USB host. |
 | Wiring ESP32 ↔ FPGA | Done (pin table in section 6). SCK, MOSI verified with an edge-counting probe; CS picks up only noise (cause not found: ESP32 pin, wire or FPGA pin). |
 | DAC | Not chosen / not connected. The FPGA already drives `dac_d[7:0]` and `dac_clk`. For an oscilloscope without a DAC: `scope_sd` (pin 40, 1-bit sigma-delta, needs 1 kΩ + 100 pF) and `scope_trig` (pin 41), see section 6. Not yet looked at on a scope. |
-| Sensors | No potentiometers wired: the ESP32's ADC inputs float, so its readings are noise. |
-| ML model | Built (2026-09-30): two networks in `MCU /SIH/ml_model.h` (profile 6-48-48-6, amplitude 12-48-48-1), `USE_ML_MODEL 1`. Profile agrees with the physics on 99.2–99.4 %, 0.5 % overridden; amplitude within 1.8 % (median), 1.6–3.4 % extra energy. **Running on the ESP32.** |
+| Sensors | Simulated (`MCU /SIH/water_sim.h`). No potentiometers wired: in pot mode (`P`) the ESP32's ADC inputs float. |
+| ML model | Three networks in `MCU /SIH/ml_model.h` (profile 6-48-48-6, amplitude 12-48-48-1, modulation 16-32-32-3), `USE_ML_MODEL 1`. Profile agrees with the physics on 99.2–99.4 %, 0.5 % overridden; amplitude within 1.8 % (median), 1.6–3.4 % extra energy; modulation agrees on 99.7 %, 0.2 % overridden. **Running on the ESP32.** |
 | Git | Committed. |
 
 A board incident on 2026-09-29: with the ESP32 wired in, the FPGA's UART went silent and
@@ -72,8 +78,8 @@ Run everything from this folder (the project root): scripts and `$readmemh` use 
 | `sigma_delta.v` | 1-bit DAC (first-order sigma-delta) of the waveform, for an oscilloscope |
 | `spi_rx.v` | SPI slave (mode 0) that collects one packet, framed by CS or (as used now) by the pause after each burst |
 | `pkt_check.v` | Checks sync, version and CRC-8 of a packet, one byte per clock |
-| `uart_rx.v`, `uart_tx.v`, `cmd_rx.v` | USB UART (115200 8N1) and its command frames |
-| `capture.v` | Records 2^14 samples from the next pulse into BSRAM, then sends header + samples over the UART |
+| `uart_rx.v`, `uart_tx.v`, `cmd_rx.v` | USB UART (3 Mbaud 8N1) and its command frames |
+| `capture.v` | Records 2^14 samples of the next pulse (one in 2^shift, so the whole pulse fits) into BSRAM, then sends header + samples over the UART; stream mode re-arms after each |
 | `pll.v`, `button.v` | 27 → 50.142857 MHz PLL; debounced buttons |
 | `sine.hex`, `hann.hex` | ROM contents (made by `host/gen_sine.py`, `host/gen_window.py`) |
 | `tangnano9k.cst` | Pin constraints |
@@ -81,8 +87,11 @@ Run everything from this folder (the project root): scripts and `$readmemh` use 
 | `host/model.py` | Bit-exact golden model of `pulse_dds`, plus `geo_ftw` / `lfm_ftw` sweep tracks |
 | `host/mcu_packet.py` | The ESP32 packet in Python: build, parse, CRC-8, unit conversion (same maths as the firmware) |
 | `host/wavegen.py` | PC as the ESP32: sends a packet over the UART, optionally captures and checks the pulse |
-| `host/capture.py` | Receives captures (board or simulation dump), checks them, plots waveform + spectrogram |
-| `host/check_*.py` | Checkers for the unit testbenches |
+| `host/capture.py` | Receives captures (board or simulation dump), checks them, plots waveform + spectrogram; `open_board()` opens the UART |
+| `host/demo.py` | One second of the running system: streams 6 consecutive pings, checks them, plots them on one graph with a table of conditions and choices (`sim/out/demo.png`) |
+| `host/water_sim.py` | Python twin of the ESP32's simulated conditions: the conditions behind a packet, from its sequence number |
+| `host/esp_console.py` | Terminal for the ESP32's serial console that does not reset it |
+| `host/check_*.py` | Checkers for the unit testbenches; `check_water_sim.py` compares `water_sim.py` with the C++ |
 | `sim/run`, `sim/all` | Run one testbench / all testbenches with their checkers |
 | `sim/*_tb.v` | Testbenches (see section 9) |
 | `sim/top_frames.hex`, `sim/top_spi.hex` | Stimulus for `top_tb`, made by `wavegen.py --frames-out / --spi-out` |
@@ -145,17 +154,27 @@ top: dac_d = {~out[11], out[10:4]} (offset binary, top 8 bits); dac_clk = ~clk (
 
 Power-up settings and **S1** presets (13,000-clock pulses every 25,000 clocks):
 LFM chirp 150 → 500 kHz, geometric sweep 150 → 500 kHz, BPSK Barker-13 at 300 kHz (1,000
-clocks per chip). A connected ESP32 replaces them within 100 ms.
+clocks per chip). A connected ESP32 replaces them within 20 ms.
+
+The packet's `seq`, `profileId` and `flags` travel with its settings (`cur_tag`), and a 16-bit
+counter numbers the pulses, so every capture says which packet and which pulse it holds.
 
 ### Capture (`capture.v`)
-Armed by **S2** or the UART command `A5 02 02`. Records 2^14 = 16,384 samples starting at the
-next pulse start (327 µs; longer pulses are captured only in part), then sends a 37-byte
-header and the samples as little-endian int16 over the UART (~3 s at 115200 baud). The header
-is frozen at the pulse start, so it always describes the captured pulse.
+Armed by **S2** or the UART command `A5 02 02`; `A5 03 03` turns on **stream mode** (re-armed
+after every capture, so every pulse that starts after the previous capture has been sent is
+captured) and `A5 04 04` turns it off. Records 2^14 = 16,384 samples from the next pulse start,
+keeping **one sample in 2^shift**, where `shift` is the smallest that fits the whole pulse
+(`fit_shift` in `top.v`: 0 up to 327 µs, 2 for 1 ms pulses, 4 for 5 ms, 6 for 20 ms), then
+sends a 43-byte header and the samples as little-endian int16 over the UART (~0.11 s at 3
+Mbaud: 6 pings a second fit). The header is frozen at the pulse start, so it always describes
+the captured pulse. At one sample in 64 (20 ms pulses) the capture rate is 783 kS/s: fine for
+the L profiles (100–140 kHz) that use 20 ms, not for an X profile at 20 ms (never chosen).
 
-Header (little-endian): `A5 5A`, `mod` u8, `N` u16, `len` u32, `ftw_start` u32, `ftw_step` u32,
-`win_step` u32, `code` u16, `chip_len` u32, `amp` u16, `period` u32, good SPI packets u16,
-bad SPI packets u16 (`HDR = "<BHIIIIHIHIHH"` after the two sync bytes in `host/capture.py`).
+Header (little-endian): `A5 5A`, `{shift[3:0], 00, mod[1:0]}` u8, `N` u16, `len` u32,
+`ftw_start` u32, `ftw_step` u32, `win_step` u32, `code` u16, `chip_len` u32, `amp` u16,
+`period` u32, good SPI packets u16, bad SPI packets u16, packet `seq` u16, pulse number u16,
+packet `profileId` u8, packet `flags` u8 (`HDR = "<BHIIIIHIHIHHHHBB"` after the two sync bytes
+in `host/capture.py`).
 
 The buffer is 16 BSRAM banks of 1024 × 12 bits (see section 7 for why).
 
@@ -174,7 +193,7 @@ byte 5 and bytes 28–55; the rest is telemetry.
 | 4 | `profileId` | 0–11 (0xFF from the PC) |
 | 5 | `modulation` | **FPGA**: 0 CW, 1 LFM, 2 geometric, 3 BPSK |
 | 6 | `spreadingFactor` | round(log2(bw × T)) for sweeps |
-| 7 | `flags` | bit0 link OK, bit1 low battery, bit2 input clamped, bit3 ML used, bit4 best effort, bit5 ML overridden, bit6 ML amplitude raised |
+| 7 | `flags` | bit0 link OK, bit1 low battery, bit2 input clamped, bit3 ML profile used, bit4 best effort, bit5 ML profile overridden, bit6 ML amplitude raised, bit7 ML modulation overridden |
 | 8–27 | `centerFreqHz`, `bandwidthHz`, `pulseUs`, `amplitude` (0–65535), `txPowerMilliW`, `propDelayUs` | telemetry |
 | 28–31 | `lenClk` | **FPGA**: pulse length, clocks (BPSK: 13 × `chipLen`) |
 | 32–35 | `ftwStart` | **FPGA**: start FTW (fc for CW/BPSK, fc − bw/2 for sweeps) |
@@ -183,11 +202,11 @@ byte 5 and bytes 28–55; the rest is telemetry.
 | 44–45 | `ampQ12` | **FPGA**: 4096 = 1.0 |
 | 46–47 | `code` | **FPGA**: BPSK code (0x0A60), else 0 |
 | 48–51 | `chipLen` | **FPGA**: BPSK clocks per chip, else 0 |
-| 52–55 | `periodClk` | **FPGA**: clocks between pulse starts (0.1 s minimum; + round trip in echo mode) |
+| 52–55 | `periodClk` | **FPGA**: clocks between pulse starts (1/6 s minimum = `PING_PERIOD_MIN_S`; + round trip in echo mode) |
 | 56 | `crc8` | CRC-8, poly 0x07, init 0, over bytes 0–55 (check value of "123456789" = 0xF4) |
 
-**SPI**: mode 0 (SCK idles low, sample on rising edge), MSB first, 2 MHz. The ESP32 sends each
-packet as one continuous 57-byte burst (228 µs) every 100 ms, with CS low around it.
+**SPI**: mode 0 (SCK idles low, sample on rising edge), MSB first, 2 MHz. The ESP32 sends the
+latest packet as one continuous 57-byte burst (228 µs) every 20 ms, with CS low around it.
 **Framing on the current boards: without CS** (`spi_rx` parameter `USE_CS = 0` in `top.v`): a
 frame ends when SCK has been quiet for 100 µs (`GAP` = 5000 clocks). This was needed because
 the CS connection (ESP32 GPIO14 → FPGA pin 36) only ever showed noise on the FPGA side (an
@@ -195,10 +214,14 @@ edge-counting probe saw 26–201 random edges/s instead of 10/s), while SCK (exa
 and MOSI were clean. If CS is ever fixed, set `USE_CS(1)` to frame by CS again. Either way, any
 byte count other than 57, a bad CRC, a wrong sync or version → rejected and counted.
 
-**UART (PC)**: 115200 8N1 on the Tang Nano's second FTDI channel.
+**UART (PC)**: 3 Mbaud 8N1 on the Tang Nano's second FTDI channel (the FPGA runs at
+F_CLK / 17 = 2.95 Mbaud, 1.7 % from the PC's 3 Mbaud, within UART tolerance).
 - `A5 01 <57-byte packet> <xor of 01 and the 57 bytes>`: set the waveform.
-- `A5 02 02`: capture the next pulse.
+- `A5 02 02`: capture the next pulse. `A5 03 03` / `A5 04 04`: stream mode on / off.
 - A frame whose bytes stop arriving for 1 ms is dropped.
+- **Open the port twice**: the first open after the board is plugged in or loaded does not take
+  the 3 Mbaud setting and nothing gets through; `host/capture.py:open_board()` opens and closes
+  it once first.
 
 ---
 
@@ -242,6 +265,8 @@ unpowered FPGA back-feeds it through the pin protection.
 **USB devices**: Tang Nano = `/dev/ttyUSB0` (JTAG) + `/dev/ttyUSB1` (UART), FTDI 0403:6010.
 ESP32-S3 = `/dev/ttyACM0` (USB-Serial/JTAG, 303a:1001). If another USB-serial adapter is
 plugged in, the numbers can shift: check with `ls /dev/ttyUSB* /dev/ttyACM*`, pass `--port`.
+The ESP32 runs without a USB host (e.g. from a power bank); only the FPGA must be on the PC
+for `host/demo.py`.
 
 ---
 
@@ -275,8 +300,9 @@ Findings on the real chip — **do not undo these**:
 
 ## 8. ESP32-S3 firmware (`MCU /SIH/`)
 
-Files: `adaptive_sonar.ino` (pins, ADC, FreeRTOS tasks, SPI, serial), `sonar_core.h` (physics,
-decision, FPGA unit conversion, packet — pure C++, PC-testable), `sonar_config.h` (every
+Files: `adaptive_sonar.ino` (pins, ADC, FreeRTOS tasks, SPI, serial console), `sonar_core.h`
+(physics, decision, Doppler modulation rule, FPGA unit conversion, packet — pure C++,
+PC-testable), `water_sim.h` (simulated water conditions), `sonar_config.h` (every
 tunable number and the profile table), `physics_reference.py` (Python twin of the physics,
 also makes ML datasets), `README_adaptive_sonar.md` (the team's full write-up: equations,
 assumptions, sources), `adaptive_sonar_project.zip` (the same files in Arduino layout plus
@@ -289,7 +315,7 @@ loose file: extract the zip to a temporary folder, copy the edited files into
 command on this machine; use Python's `zipfile`). The Arduino sketch folder must be named
 `adaptive_sonar`.
 
-**What it does** (10 Hz): Mackenzie sound speed → Francois–Garrison absorption + turbidity
+**What it does** (per ping, 6 a second): Mackenzie sound speed → Francois–Garrison absorption + turbidity
 loss + spherical spreading → thermal + wind noise → output SNR after pulse compression
 (`SL + 10·log T − TL − N0`, i.e. set by pulse energy) → for every profile: does it close the
 link (12 dB threshold + 3 dB margin) and how much energy per ping does it need (just enough
@@ -298,19 +324,41 @@ is at most max(`DETAIL_ENERGY_FACTOR` (4) × the cheapest working profile's ener
 `DETAIL_FREE_ENERGY_FRAC` (1 %) × this ping's energy budget); a profile finer than the
 previous one needs 2 dB extra margin (anti flip-flop) → if none closes the link, L-L at
 maximum allowed power (best effort) → packet. Lower frequencies always need less energy, so
-the rule only ever picks X-S, H-S, M-S, L-S, L-M or L-L. Four FreeRTOS tasks: sensor 50 Hz,
-decision 10 Hz, SPI 10 Hz (highest priority), logger (status line every 500 ms).
+the rule only ever picks X-S, H-S, M-S, L-S, L-M or L-L. Then the **modulation from the
+motion** (`chooseModulation()`, `sonar_config.h` section 4c): the Doppler drift over the pulse
+is fd·T cycles with fd = speed / c × fc (× 2 in echo mode); BPSK while it is ≤ 0.25, LFM up to
+1, geometric beyond (BPSK is the cleanest when still, geometric tolerates the most motion).
+Four FreeRTOS tasks: sensor 50 Hz (pots / typed inputs), decision 6 Hz (one per ping, exactly 6
+per second on average; steps the simulation in automatic mode; anti flip-flop memory per
+contact), SPI 50 Hz (highest priority, sends the latest packet), console.
 
-**Profiles** (all LFM in the table): X 380–500 kHz, H 270–330 kHz, M 180–220 kHz,
-L 100–140 kHz, each with 1 / 5 / 20 ms pulses.
+**Simulated conditions** (`water_sim.h`, automatic mode, the default at power-on): a vehicle
+dives and climbs 20 → 350 m every 20 mission-minutes through a thermocline (22 → 5 °C) and
+halocline (34.4 → 35.2 ppt); turbidity = background + drifting plumes + a muddy layer below
+300 m; battery drains and recharges at 15 %; three contacts, pinged in turn: A 15–180 m and
+lively, B 250–600 m and nearly still, C 450–1000 m and moving (range and radial speed follow
+smooth random motions; the speed is the range rate). Sensor noise on every reading; mission
+time runs 10× real time. Deterministic from its seed: `host/water_sim.py` reproduces it
+(`host/check_water_sim.py`: within 0.001 over 20,000 pings).
 
-**Serial commands** (115200 on `/dev/ttyACM0`): `R <metres>` target range (10–2000, default
-300); `M lfm | geo | bpsk | cw | auto` forces the modulation for whatever profile the physics
-picks (`auto` = the table's LFM).
+**Profiles** (LFM in the table; the modulation is chosen per ping): X 380–500 kHz,
+H 270–330 kHz, M 180–220 kHz, L 100–140 kHz, each with 1 / 5 / 20 ms pulses.
+
+**Serial console** (115200 on `/dev/ttyACM0`; `host/esp_console.py` opens it without resetting):
+- `A`: automatic (simulated conditions); prints one `PING seq=… contact=… T=… S=… D=… turb=…
+  bat=… R=… v=… profile=… mod=… amp=… ml_profile=… ml_mod=… ml_amp=… flags=… doppler=…`
+  line per ping.
+- `W` (or Enter when not automatic): asks for the seven inputs one by one, then prints a full
+  report (network picks and the physics check, result, FPGA values). `I T S D turb bat R v`:
+  the same on one line, ending with a `DECISION` line.
+- `R <metres>`, `M lfm | geo | bpsk | cw | auto` (force a modulation; `auto` = from the
+  motion), `P` (potentiometers), `L` (status line), `?`.
+- The console writes in 32-byte pieces and waits for each to leave: the USB-Serial/JTAG
+  driver loses text when it is queued faster, and `Serial.flush()` can discard it.
 
 **Build and flash**:
 ```
-cp "MCU /SIH/"{adaptive_sonar.ino,sonar_core.h,sonar_config.h} <tmp>/adaptive_sonar/
+cp "MCU /SIH/"{adaptive_sonar.ino,sonar_core.h,sonar_config.h,water_sim.h,ml_model.h} <tmp>/adaptive_sonar/
 arduino-cli compile -b "esp32:esp32:esp32s3:CDCOnBoot=cdc,FlashSize=16M,PSRAM=disabled" --output-dir <tmp>/build <tmp>/adaptive_sonar
 arduino-cli upload  -p /dev/ttyACM0 -b "<same fqbn>" --input-dir <tmp>/build <tmp>/adaptive_sonar
 esptool --chip esp32s3 -p /dev/ttyACM0 --before no-reset --after watchdog-reset read-mac   # start the program
@@ -321,22 +369,24 @@ esptool --chip esp32s3 -p /dev/ttyACM0 --before no-reset --after watchdog-reset 
   watchdog reset above starts the firmware.
 - Open the serial port with DTR and RTS **off**: on this USB port they drive BOOT and RESET.
 
-**ML model** (required by the project; built 2026-09-30). The ML chooses the waveform; the
-physics checks it.
-- **What runs** (`MCU /SIH/ml_model.h`, 23.5 KB, generated by `MCU /SIH/ml/train.py`,
-  `USE_ML_MODEL 1` by default), called by `mlSelect()` in the sketch:
+**ML model** (required by the project). The ML chooses the waveform; the physics checks it.
+- **What runs** (`MCU /SIH/ml_model.h`, 30 KB of weights, generated by `MCU /SIH/ml/train.py`,
+  `USE_ML_MODEL 1` by default), called by `mlSelect()` and `mlModulation()` in the sketch:
   - profile network 6 → 48 → 48 → 6 (ReLU): one score per profile the rule ever picks
     (`ML_CLASSES` maps outputs to profile numbers);
   - amplitude network 12 → 48 → 48 → 1: the 6 inputs + the chosen profile (one-hot) →
-    log(amplitude that just closes the link, before the 5 % floor) + a +2.3 % safety margin.
+    log(amplitude that just closes the link, before the 5 % floor) + a +2.3 % safety margin;
+  - modulation network 16 → 32 → 32 → 3: temperature, salinity, depth, log10(speed + 0.01)
+    + the profile the physics settled on (one-hot of 12) → LFM / geometric / BPSK.
   Inputs: temperature, salinity, depth, turbidity, battery, range (as log10), standardised,
   clamped to the sensor ranges first.
 - **Roles** (`sonar::decide(env, range, prev, mlProfile, mlAmp)`): the ML's profile is kept
   when it closes the link within the energy allowance, with the anti flip-flop margin
   (`FLAG_ML_USED`), else the physics chooses (`FLAG_ML_OVERRIDDEN`). The ML's amplitude is used
   for the ML's profile, raised to what the link needs if short (`FLAG_ML_AMP_RAISED`, flags
-  bit 6) and capped at what is allowed. The status line shows `ML` / `ML_OVERRIDDEN` /
-  `PHYSICS`, `AMP_RAISED`, and the energy numbers (`E`, `Emin`, `allow`).
+  bit 6) and capped at what is allowed. The ML's modulation is kept when it can take the
+  Doppler drift (a more tolerant one than needed is fine), else the rule's replaces it
+  (`FLAG_ML_MOD_OVERRIDDEN`, bit 7).
 - **Data**: 300,000 scenarios labelled by `physics_reference.py` (half with log-uniform
   range), inputs rounded to float32; the amplitude network trains on the (scenario, profile)
   pairs whose needed amplitude is in the range that matters. Tested on 2 × 20,000 scenarios
@@ -345,7 +395,8 @@ physics checks it.
   range), 0.5 % overridden (XGBoost: 97–99 % with ~20k tree nodes; decision tree 94–96 %).
   Amplitude: 1.8 % median error, 1.6–3.4 % more energy than the minimum, raised in 1–2 % of
   cases. With random sensor values at fixed ranges 50–2000 m: 97.8–100 % the same profile as
-  the physics. The C code matches the Python models on all 6,000 test vectors.
+  the physics. Modulation: 99.7 % agreement, 0.2 % overridden, all disagreements within ~1 % of
+  a threshold. The C code matches the Python models on all test vectors (6,000 each).
 - **Limit**: trained on the physics, so it can only copy it. It beats the physics only when
   retrained on measured results (see open items).
 - **Retrain** after any `sonar_config.h` change that affects the choice (profiles, power,
@@ -360,9 +411,11 @@ physics checks it.
 ## 9. Build, test, run
 
 ```
-sim/all                                  # all 10 testbenches + checkers, prints ALL PASS
+sim/all                                  # all 11 testbenches + checkers, prints ALL PASS
 sim/run top_tb -w                        # one testbench, then GTKWave
 tn9k load                                # build + load the FPGA (SRAM)
+python3 host/demo.py                     # one second of the running system (ESP32 + FPGA), 6 pings
+python3 host/check_water_sim.py          # the PC's copy of the simulated conditions matches the C++
 python3 host/wavegen.py geo --fc 325e3 --bw 350e3 --capture   # PC sets a waveform, captures, checks
 python3 host/capture.py --request        # capture whatever is playing now (e.g. the ESP32's choice)
 python3 host/capture.py                  # wait for S2 presses
@@ -375,6 +428,7 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
 | Testbench | Checks |
 |---|---|
 | `phase_acc_tb`, `pulse_ctrl_tb`, `phase_code_tb` | module behaviour (self-checking) |
+| `capture_tb` | capture on its own: header, one sample in 1 / 4 / 1024 (a counter as input), and two streamed captures after one arm |
 | `dds_tb` | tone vs golden model + FFT peak |
 | `pulse_dds_tb` | windowed pulses vs golden model; window narrows the spectrum |
 | `chirp_tb` | LFM up and down, 3 ↔ 7 MHz, bit-exact + measured sweep |
@@ -393,15 +447,14 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
 2. **Choose the DAC**: it must take 8-bit parallel data at 50 MS/s (or the FPGA must slow its
    output rate), and its latch edge must match `dac_clk`. Until then, look at the waveforms on
    an oscilloscope through `scope_sd` (section 6).
-3. **Automatic choice between LFM, geometric and BPSK**: the physics scores waveforms by pulse
-   energy only, so it cannot tell them apart. It needs a relative-speed (Doppler) input:
-   geometric sweeps tolerate motion, BPSK needs a nearly still scene (≈ 0.6 m/s at 300 kHz
-   with a 1 ms pulse, ≈ 3 cm/s with 20 ms). Until then the operator uses `M`.
+3. **Doppler thresholds** (`DOPPLER_BPSK_MAX_CYCLES` 0.25, `DOPPLER_LFM_MAX_CYCLES` 1): set
+   from rules of thumb; confirm with the team (and retrain after a change). The speed input is
+   simulated; a real one needs a DVL or a Doppler estimate from echoes.
 4. **One-way link or echo sonar** (`ACTIVE_ECHO_MODE`): changes the loss maths and the period
    (echo mode waits for the round trip).
-5. Sensors: wire the potentiometers (GPIO 1–5) or real sensors.
-6. Capturing whole long pulses: the buffer holds 327 µs; 1–20 ms pulses need decimation or a
-   bigger/external buffer to be seen in full.
+5. Sensors: real sensors (or the potentiometers, GPIO 1–5) instead of the simulation.
+6. Captures of 20 ms pulses keep one sample in 64 (783 kS/s): enough for 100–140 kHz, but a
+   20 ms pulse above ~390 kHz would alias (no such profile is chosen today).
 7. MISO (pin 39 ↔ GPIO11) is wired but unused; it could return status to the ESP32.
 8. From the firmware's own list: transducer coverage of 100–500 kHz, turbidity loss
    calibration, where the target range comes from.
@@ -409,8 +462,10 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
     `DETAIL_FREE_ENERGY_FRAC` (0.01) in `sonar_config.h`; retrain the ML after changing them.
 10. **Close the loop** for ML that can beat the physics: measure the received level per ping
     (hydrophone → amp → log detector → ESP32 ADC) and log it with the inputs and the choice.
-    Later: a speed (Doppler) estimate from echoes would also enable automatic LFM / geometric /
-    BPSK choice.
+    Later: a speed (Doppler) estimate from echoes would replace the simulated speed.
+11. The ESP32 and FPGA ping clocks are independent (both 6 Hz from their own crystals): about
+    once every few hours a ping may repeat or skip a decision. A MISO or trigger line from the
+    FPGA could synchronise them.
 
 ---
 

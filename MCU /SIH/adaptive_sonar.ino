@@ -2,8 +2,11 @@
   ============================================================================
   Adaptive Sonar Parameter Engine  --  ESP32-S3 (N16R8) + FreeRTOS
   ============================================================================
-  Reads 5 "sensors" (potentiometers), runs the physics model, picks a waveform
-  profile (100-500 kHz), and sends the result to the FPGA over SPI.
+  Takes the conditions (by default from a simulation of changing water conditions,
+  water_sim.h; or typed on the serial console, or 5 potentiometers), runs the physics
+  model and the neural networks, picks a waveform for every ping (profile 100-500 kHz,
+  amplitude, and LFM / geometric / BPSK from the motion), 6 pings a second, and sends
+  it to the FPGA over SPI.
 
   Files:  sonar_config.h  = every tunable number + the profile table
           sonar_core.h    = physics, decision logic, FPGA packet (PC-testable)
@@ -14,19 +17,31 @@
     Flash size 16MB | PSRAM "Disabled" (not needed) | USB CDC On Boot: Enabled
     (if you use the native USB port for Serial)
 
-  Serial commands (115200 baud):   R 450   -> set target range to 450 m
-                                   M geo   -> waveform: auto | lfm | geo | bpsk | cw
-                                   ?       -> help
+  Serial commands (115200 baud; host/esp_console.py in the FPGA project is a terminal that
+  does not reset the board):
+      A          -> automatic: simulated water conditions (the default); prints one PING
+                    line per ping
+      Enter or W -> type new inputs: it asks for each value, then prints the decision
+      I 15 35 50 20 100 300 0.5 -> all seven inputs on one line (temperature, salinity, depth,
+                    turbidity, battery, range, speed); the report ends with a DECISION line
+                    for programs (host/demo.py)
+      R 450      -> set target range to 450 m
+      M geo      -> modulation: auto | lfm | geo | bpsk | cw
+      P          -> inputs from the potentiometers <-> typed inputs
+      L          -> live status line on/off
+      ?          -> help
   ============================================================================
 */
 #include <Arduino.h>
 #include <SPI.h>
 #include "sonar_config.h"
 #include "sonar_core.h"
+#include "water_sim.h"
 
-// 1 = the ML model picks the profile and its amplitude (ml_model.h, see ml/); the physics keeps
-//     the pick when it closes the link within the energy allowance and overrides it otherwise
-//     (FLAG_ML_USED / FLAG_ML_OVERRIDDEN), and raises the amplitude if it is too low
+// 1 = the ML model picks the profile, its amplitude and the modulation (ml_model.h, see ml/); the
+//     physics keeps the profile when it closes the link within the energy allowance and overrides
+//     it otherwise (FLAG_ML_USED / FLAG_ML_OVERRIDDEN), raises the amplitude if it is too low, and
+//     replaces a modulation that cannot take the motion (FLAG_ML_MOD_OVERRIDDEN)
 // 0 = physics only
 #ifndef USE_ML_MODEL
 #define USE_ML_MODEL 1
@@ -55,30 +70,43 @@
 
 /* ------------------------------------------------------------- RTOS setup */
 #define SENSOR_PERIOD_MS    20            // 50 Hz sensor sampling
-#define DECISION_PERIOD_MS  100           // 10 Hz decisions
-#define SPI_PERIOD_MS       100           // 10 Hz packet refresh to FPGA
+// decisions: PING_RATE_HZ (sonar_config.h), one per ping
+#define SPI_PERIOD_MS       20            // 50 Hz packet refresh to FPGA (a new decision reaches it fast)
 #define LOG_PERIOD_MS       500
 #define SENSOR_STALE_MS     500           // decision refuses data older than this
 #define SENSOR_FILTER_ALPHA 0.2f          // EMA smoothing of pot noise
 
-// priorities (higher = more urgent): SPI > decision > sensor > logger
+// priorities (higher = more urgent): SPI > decision > sensor > console
 #define PRIO_SPI            4
 #define PRIO_DECISION       3
 #define PRIO_SENSOR         2
-#define PRIO_LOGGER         1
-#define CORE_A              0             // SPI + logger
+#define PRIO_CONSOLE        1
+#define CORE_A              0             // SPI + console
 #define CORE_B              1             // sensor + decision
 
 /* ----------------------------------------------------------- shared data */
-struct SensorSample { sonar::Env env; uint32_t stampMs; };
-struct Telemetry    { sonar::Env env; sonar::Decision dec; uint32_t rangeM; uint16_t seq; uint32_t staleCount; int32_t mod; };
+// version: bumped by every typed change, so the decision starts fresh and the console can wait for it
+struct SensorSample { sonar::Env env; uint32_t stampMs; uint32_t version; };
+struct MlPick       { int profile; float amp; int mod; };   // the ML's own picks (-1 = none)
+struct Telemetry    { sonar::Env env; sonar::Decision dec; sonar::SonarPacket pkt; uint32_t rangeM;
+                      uint32_t staleCount; int32_t forcedMod; uint32_t version; MlPick ml;
+                      int contact; float missionS; };           // contact: the simulator's, -1 = none
 
 static QueueHandle_t qSensor = NULL;   // length 1, always holds the LATEST sample
 static QueueHandle_t qPacket = NULL;   // length 1, always holds the LATEST packet
-static QueueHandle_t qTelem  = NULL;   // length 1, latest telemetry for the logger
+static QueueHandle_t qTelem  = NULL;   // length 1, latest telemetry for the console
+static QueueHandle_t qPing   = NULL;   // every decision, for the PING log
 
 static volatile uint32_t gTargetRangeM = DEFAULT_TARGET_RANGE_M;  // aligned 32-bit write is atomic
-static volatile int32_t  gModulation   = -1;   // M command: -1 = auto (the profile's own), else Modulation
+static volatile int32_t  gModulation   = -1;   // M command: -1 = auto (from the motion), else Modulation
+static volatile bool     gSim          = true;   // A command: simulated water conditions (water_sim.h)
+static volatile bool     gUsePots      = false;  // P command: potentiometers, else typed inputs
+static volatile bool     gLive         = false;  // L command: status line every LOG_PERIOD_MS
+
+// The typed inputs (the speed is typed in both modes: there is no sensor for it yet)
+static portMUX_TYPE      gInputLock    = portMUX_INITIALIZER_UNLOCKED;
+static sonar::Env        gTyped        = { 15.0f, 35.0f, 50.0f, 20.0f, 100.0f, DEFAULT_SPEED_MS };
+static uint32_t          gInputVersion = 0;
 
 static const char *const MOD_NAMES[] = { "cw", "lfm", "geo", "bpsk" };
 static SPIClass spiFpga(FSPI);
@@ -88,14 +116,20 @@ static SPIClass spiFpga(FSPI);
 // The ML model's choice (two small neural networks trained by ml/train.py on the physics'
 // own decisions): the profile, and the amplitude for that profile. It always answers;
 // sonar::decide() checks it with the physics.
-struct MlChoice { int profile; float amp; };
-static MlChoice mlSelect(const sonar::Env &env, uint32_t rangeM) {
+static MlPick mlSelect(const sonar::Env &env, uint32_t rangeM) {
   sonar::Env e = env;
   sonar::sanitizeEnv(e);                              // the ranges the model was trained on
   const float r = sonar::clampf((float)rangeM, (float)MIN_TARGET_RANGE_M, (float)MAX_TARGET_RANGE_M);
   const float in[ml::ML_IN] = { e.tempC, e.salinityPpt, e.depthM, e.turbidityNtu, e.batteryPct, r };
   const int k = ml::ml_predict_profile(in);
-  return { k, ml::ml_predict_amplitude(in, k) };
+  return { k, ml::ml_predict_amplitude(in, k), -1 };
+}
+// The modulation for the profile the physics settled on
+static int mlModulation(const sonar::Env &env, int profile) {
+  sonar::Env e = env;
+  sonar::sanitizeEnv(e);
+  const float in[4] = { e.tempC, e.salinityPpt, e.depthM, e.speedMs };
+  return ml::ml_predict_modulation(in, profile);
 }
 #endif
 
@@ -110,18 +144,31 @@ static float scaleToRange(float lo, float hi, float t) { return lo + t * (hi - l
 
 /* ================================================================ TASKS */
 
-// 1) SENSOR TASK: fixed-rate ADC read + smoothing -> latest sample queue.
+// 1) SENSOR TASK: fixed-rate ADC read + smoothing (or the typed inputs) -> latest sample queue.
 static void sensorTask(void *) {
   sonar::Env f = {};
   bool first = true;
   TickType_t last = xTaskGetTickCount();
   for (;;) {
+    portENTER_CRITICAL(&gInputLock);
+    const sonar::Env typed = gTyped;
+    const uint32_t version = gInputVersion;
+    portEXIT_CRITICAL(&gInputLock);
+    if (!gUsePots) {
+      f = typed;                              // exact, no smoothing
+      first = true;
+      const SensorSample s = { f, millis(), version };
+      xQueueOverwrite(qSensor, &s);
+      vTaskDelayUntil(&last, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
+      continue;
+    }
     sonar::Env raw;
     raw.tempC        = scaleToRange(TEMP_MIN_C,      TEMP_MAX_C,      readPotFraction(PIN_POT_TEMP));
     raw.salinityPpt  = scaleToRange(SALINITY_MIN_PPT, SALINITY_MAX_PPT, readPotFraction(PIN_POT_SALINITY));
     raw.depthM       = scaleToRange(DEPTH_MIN_M,     DEPTH_MAX_M,     readPotFraction(PIN_POT_DEPTH));
     raw.turbidityNtu = scaleToRange(TURBIDITY_MIN_NTU, TURBIDITY_MAX_NTU, readPotFraction(PIN_POT_TURBIDITY));
     raw.batteryPct   = scaleToRange(BATTERY_MIN_PCT, BATTERY_MAX_PCT, readPotFraction(PIN_POT_BATTERY));
+    raw.speedMs      = typed.speedMs;
 
     if (first) { f = raw; first = false; }
     else {
@@ -131,41 +178,77 @@ static void sensorTask(void *) {
       f.depthM       += a * (raw.depthM       - f.depthM);
       f.turbidityNtu += a * (raw.turbidityNtu - f.turbidityNtu);
       f.batteryPct   += a * (raw.batteryPct   - f.batteryPct);
+      f.speedMs       = raw.speedMs;
     }
-    SensorSample s = { f, millis() };
+    const SensorSample s = { f, millis(), version };
     xQueueOverwrite(qSensor, &s);
     vTaskDelayUntil(&last, pdMS_TO_TICKS(SENSOR_PERIOD_MS));
   }
 }
 
-// 2) DECISION TASK: physics -> profile -> packet. Never touches SPI or Serial.
+// 2) DECISION TASK: physics + ML -> profile, amplitude, modulation -> packet.
+//    Never touches SPI or Serial.
 static void decisionTask(void *) {
-  int prev = -1;
+  int prev[4] = { -1, -1, -1, -1 };    // anti flip-flop memory per target: the simulator's 3 contacts, or 1
+  uint32_t lastVersion = 0;
   uint16_t seq = 0;
   uint32_t stale = 0;
-  TickType_t last = xTaskGetTickCount();
-  for (;;) {
-    SensorSample s;
-    if (xQueuePeek(qSensor, &s, 0) == pdTRUE && (millis() - s.stampMs) <= SENSOR_STALE_MS) {
-      const uint32_t r = gTargetRangeM;
-      int hint = -1;
-      float hintAmp = -1.0f;
+  watersim::Sim sim;
+  watersim::init(sim);
+  const TickType_t t0 = xTaskGetTickCount();
+  for (uint32_t k = 1;; k++) {
+    sonar::Env env;
+    uint32_t r = 0, version = 0;
+    int who = -1;
+    float missionS = 0.0f;
+    bool fresh = false;
+    if (gSim) {
+      const watersim::Reading w = watersim::step(sim, 1.0f / PING_RATE_HZ);
+      env = { w.tempC, w.salinityPpt, w.depthM, w.turbidityNtu, w.batteryPct, w.speedMs };
+      r = (uint32_t)lroundf(w.rangeM);
+      who = w.contact;
+      missionS = w.missionS;
+      version = gInputVersion;
+      fresh = true;
+    } else {
+      SensorSample s;
+      if (xQueuePeek(qSensor, &s, 0) == pdTRUE && (millis() - s.stampMs) <= SENSOR_STALE_MS) {
+        env = s.env;
+        r = gTargetRangeM;
+        version = s.version;
+        fresh = true;
+      }
+    }
+    if (fresh) {
+      if (version != lastVersion) {                       // new inputs: fresh start
+        for (int &p : prev) p = -1;
+        lastVersion = version;
+      }
+      int &last = prev[who >= 0 ? who : 3];
+      MlPick ml = { -1, -1.0f, -1 };
 #if USE_ML_MODEL
-      const MlChoice ml = mlSelect(s.env, r);
-      hint = ml.profile;
-      hintAmp = ml.amp;
+      ml = mlSelect(env, r);
 #endif
-      const sonar::Decision d = sonar::decide(s.env, (float)r, prev, hint, hintAmp);
-      prev = d.profile;
-      const sonar::SonarPacket pkt = sonar::buildPacket(d, seq, gModulation);
+      sonar::Decision d = sonar::decide(env, (float)r, last, ml.profile, ml.amp);
+#if USE_ML_MODEL
+      ml.mod = mlModulation(env, d.profile);
+#endif
+      sonar::chooseModulation(d, env, ml.mod);
+      last = d.profile;
+      const int32_t forced = gModulation;
+      const sonar::SonarPacket pkt = sonar::buildPacket(d, seq, forced);
       xQueueOverwrite(qPacket, &pkt);
-      Telemetry t = { s.env, d, r, seq, stale, gModulation };
+      const Telemetry t = { env, d, pkt, r, stale, forced, version, ml, who, missionS };
       xQueueOverwrite(qTelem, &t);
+      xQueueSend(qPing, &t, 0);
       seq++;
     } else {
       stale++;                       // no fresh data: keep the last good packet going
     }
-    vTaskDelayUntil(&last, pdMS_TO_TICKS(DECISION_PERIOD_MS));
+    // PING_RATE_HZ exactly on average (1000 / 6 ms is not a whole number of ticks)
+    const TickType_t next = t0 + pdMS_TO_TICKS((uint64_t)k * 1000u / PING_RATE_HZ);
+    const TickType_t now = xTaskGetTickCount();
+    if ((int32_t)(next - now) > 0) vTaskDelay(next - now);
   }
 }
 
@@ -185,76 +268,332 @@ static void spiTask(void *) {
   }
 }
 
-// 4) LOGGER TASK: lowest priority. Prints status and handles serial commands.
+// 4) CONSOLE TASK: lowest priority. Serial commands, the typed-input prompts, the decision report
+//    and the optional live status line.
+
+// Console output in small pieces, each sent before the next is queued: the USB-Serial/JTAG driver
+// loses text when it is queued faster than the host collects it, and Serial.flush() can discard it
+static void out(const char *fmt, ...) {
+  static int emptyRoom = 0;                 // free space of the empty transmit buffer
+  char buf[320];
+  va_list a;
+  va_start(a, fmt);
+  const int n = vsnprintf(buf, sizeof buf, fmt, a);
+  va_end(a);
+  for (int i = 0; i < n && i < (int)sizeof buf - 1; i += 32) {
+    Serial.write((const uint8_t *)buf + i, (n - i < 32) ? n - i : 32);
+    for (int w = 0; w < 20; w++) {
+      const int room = Serial.availableForWrite();
+      if (room > emptyRoom) emptyRoom = room;
+      if (room >= emptyRoom) break;
+      vTaskDelay(1);
+    }
+    vTaskDelay(1);                          // the host picks it up from the chip
+  }
+}
+
+// The values the W command asks for, in order
+struct Field { const char *name; const char *unit; float lo, hi; };
+static const Field FIELDS[] = {
+  { "Temperature",    "C",   TEMP_MIN_C,                TEMP_MAX_C },
+  { "Salinity",       "ppt", SALINITY_MIN_PPT,          SALINITY_MAX_PPT },
+  { "Depth",          "m",   DEPTH_MIN_M,               DEPTH_MAX_M },
+  { "Turbidity",      "NTU", TURBIDITY_MIN_NTU,         TURBIDITY_MAX_NTU },
+  { "Battery",        "%",   BATTERY_MIN_PCT,           BATTERY_MAX_PCT },
+  { "Target range",   "m",   (float)MIN_TARGET_RANGE_M, (float)MAX_TARGET_RANGE_M },
+  { "Relative speed", "m/s", SPEED_MIN_MS,              SPEED_MAX_MS },
+};
+static const int NUM_FIELDS = (int)(sizeof(FIELDS) / sizeof(FIELDS[0]));
+
+static float    gDraft[NUM_FIELDS];
+static int      gAsk = -1;               // the field being asked for, -1 = not asking
+static uint32_t gWaitVersion = 0;        // print the report of the decision with this input version
+static uint32_t gWaitStartMs = 0;
+static bool     gWaiting = false;
+static bool     gMachine = false;        // the I command: end the report with a DECISION line
+
+static void printPrompt() {
+  if (!gSim) out("\nEnter = new inputs, ? = help > ");
+}
+
+static void printHelp() {
+  out("\n  A            automatic: simulated water conditions, one PING line per ping\n");
+  out("  Enter or W   type new inputs (Enter keeps a value, q cancels)\n");
+  out("  R <metres>   target range, e.g. R 450\n");
+  out("  M <mod>      modulation: auto (from the motion) | lfm | geo | bpsk | cw\n");
+  out("  P            inputs from the potentiometers <-> typed inputs\n");
+  out("  L            live status line on/off\n");
+}
+
+// Apply a change and wait for the decision that uses it
+static void inputsChanged() {
+  portENTER_CRITICAL(&gInputLock);
+  gWaitVersion = ++gInputVersion;
+  portEXIT_CRITICAL(&gInputLock);
+  gWaiting = true;
+  gWaitStartMs = millis();
+}
+
+static void askField() {
+  const Field &f = FIELDS[gAsk];
+  out("%s (%g..%g %s) [%g]: ", f.name, f.lo, f.hi, f.unit, gDraft[gAsk]);
+}
+
+static void startAsking() {
+  portENTER_CRITICAL(&gInputLock);
+  const sonar::Env e = gTyped;
+  portEXIT_CRITICAL(&gInputLock);
+  const float now[NUM_FIELDS] = { e.tempC, e.salinityPpt, e.depthM, e.turbidityNtu, e.batteryPct,
+                                  (float)gTargetRangeM, e.speedMs };
+  memcpy(gDraft, now, sizeof(gDraft));
+  out("%s\n", gUsePots ? "\nPotentiometers are on (P): only the range and the speed are used from here."
+                          : "\nNew inputs (Enter keeps the value in brackets, q cancels):");
+  gAsk = 0;
+  askField();
+}
+
+static void finishAsking() {
+  gAsk = -1;
+  gSim = false;
+  gMachine = false;
+  portENTER_CRITICAL(&gInputLock);
+  gTyped.tempC        = gDraft[0];
+  gTyped.salinityPpt  = gDraft[1];
+  gTyped.depthM       = gDraft[2];
+  gTyped.turbidityNtu = gDraft[3];
+  gTyped.batteryPct   = gDraft[4];
+  gTyped.speedMs      = gDraft[6];
+  gTargetRangeM       = (uint32_t)lroundf(gDraft[5]);
+  portEXIT_CRITICAL(&gInputLock);
+  inputsChanged();
+}
+
+static void answerField(const char *w) {
+  if (*w == 'q' || *w == 'Q') { gAsk = -1; out("cancelled\n"); printPrompt(); return; }
+  if (*w) {
+    char *end;
+    const float v = strtof(w, &end);
+    const Field &f = FIELDS[gAsk];
+    if (end == w || *end || !(v >= f.lo && v <= f.hi)) {
+      out("  \"%s\": must be a number from %g to %g\n", w, f.lo, f.hi);
+      askField();
+      return;
+    }
+    gDraft[gAsk] = v;
+  }
+  if (++gAsk < NUM_FIELDS) askField();
+  else finishAsking();
+}
+
+static void handleCommand(char *w) {
+  const char c = *w;
+  if (c == 0 && gSim) return;                              // Enter alone does not stop the simulation
+  if (c == 0 || c == 'W' || c == 'w') { startAsking(); return; }
+  if (c == 'A' || c == 'a') {
+    gSim = true;
+    gAsk = -1;
+    out("  automatic: simulated water conditions, %d pings per second\n", PING_RATE_HZ);
+    inputsChanged();
+    return;
+  }
+  w++;
+  while (*w == ' ') w++;
+  if (c == 'I' || c == 'i') {
+    float v[NUM_FIELDS];
+    const char *p = w;
+    for (int i = 0; i < NUM_FIELDS; i++) {
+      char *end;
+      v[i] = strtof(p, &end);
+      if (end == p || !(v[i] >= FIELDS[i].lo && v[i] <= FIELDS[i].hi)) {
+        out("  ERROR input %d (%s) must be %g..%g %s\n", i + 1, FIELDS[i].name, FIELDS[i].lo, FIELDS[i].hi, FIELDS[i].unit);
+        printPrompt();
+        return;
+      }
+      p = end;
+    }
+    memcpy(gDraft, v, sizeof(gDraft));
+    finishAsking();
+    gMachine = true;
+    return;
+  }
+  if (c == 'R' || c == 'r') {
+    const long v = atol(w);
+    if (v >= MIN_TARGET_RANGE_M && v <= MAX_TARGET_RANGE_M) {
+      gTargetRangeM = (uint32_t)v;
+      inputsChanged();
+      return;
+    }
+    out("  range must be %d..%d m\n", MIN_TARGET_RANGE_M, MAX_TARGET_RANGE_M);
+  } else if (c == 'M' || c == 'm') {
+    int m = -2;
+    if (!strcasecmp(w, "auto")) m = -1;
+    for (int i = 0; i < 4; i++) if (!strcasecmp(w, MOD_NAMES[i])) m = i;
+    if (m >= -1) {
+      gModulation = m;
+      inputsChanged();
+      return;
+    }
+    out("  modulation must be one of: auto lfm geo bpsk cw\n");
+  } else if (c == 'P' || c == 'p') {
+    gUsePots = !gUsePots;
+    gSim = false;
+    out("%s\n", gUsePots ? "  inputs from the potentiometers (speed and range stay typed)" : "  typed inputs");
+    inputsChanged();
+    return;
+  } else if (c == 'L' || c == 'l') {
+    gLive = !gLive;
+    out("%s\n", gLive ? "  live status on" : "  live status off");
+  } else {
+    printHelp();
+  }
+  printPrompt();
+}
+
 static void handleSerial() {
-  static char buf[24];
+  static char buf[64];
   static uint8_t n = 0;
+  static bool lastCR = false;
   while (Serial.available()) {
     const char ch = (char)Serial.read();
+    if (ch == '\n' && lastCR) { lastCR = false; continue; }      // CR LF = one line end
+    lastCR = (ch == '\r');
     if (ch == '\n' || ch == '\r') {
       buf[n] = 0;
-      if (n > 0) {
-        if (buf[0] == 'R' || buf[0] == 'r') {
-          const long v = atol(buf + 1);
-          if (v >= MIN_TARGET_RANGE_M && v <= MAX_TARGET_RANGE_M) {
-            gTargetRangeM = (uint32_t)v;
-            Serial.printf(">> target range = %ld m\n", v);
-          } else {
-            Serial.printf(">> range must be %d..%d m\n", MIN_TARGET_RANGE_M, MAX_TARGET_RANGE_M);
-          }
-        } else if (buf[0] == 'M' || buf[0] == 'm') {
-          const char *w = buf + 1;
-          while (*w == ' ') w++;
-          int m = -2;
-          if (!strcasecmp(w, "auto")) m = -1;
-          for (int i = 0; i < 4; i++) if (!strcasecmp(w, MOD_NAMES[i])) m = i;
-          if (m >= -1) {
-            gModulation = m;
-            Serial.printf(">> waveform = %s\n", m < 0 ? "auto (profile table)" : MOD_NAMES[m]);
-          } else {
-            Serial.println(">> waveform must be one of: auto lfm geo bpsk cw");
-          }
-        } else {
-          Serial.println(">> commands:  R <metres>   e.g.  R 450");
-          Serial.println(">>            M <waveform> auto | lfm | geo | bpsk | cw");
-        }
-      }
       n = 0;
+      char *w = buf;
+      while (*w == ' ') w++;
+      for (char *e = w + strlen(w); e > w && e[-1] == ' '; ) *--e = 0;
+      if (gAsk >= 0) answerField(w);
+      else if (!gWaiting) handleCommand(w);
     } else if (n < sizeof(buf) - 1) {
       buf[n++] = ch;
     }
   }
 }
 
-static void loggerTask(void *) {
+static const char *modName(int m) { return (m >= 0 && m <= 3) ? MOD_NAMES[m] : "-"; }
+
+static void printReport(const Telemetry &t) {
+  const sonar::Decision &d = t.dec;
+  const sonar::SonarPacket &k = t.pkt;
+  const WaveProfile &p = PROFILES[d.profile];
+  const int mod = k.modulation;
+  const double clkUs = 1.0e6 / FPGA_CLK_HZ;
+  out("\n-----------------------------------------------------------------------------\n");
+  out(" Inputs     %.1f C, %.1f ppt, depth %.0f m, turbidity %.0f NTU, battery %.0f %%%s\n",
+                t.env.tempC, t.env.salinityPpt, t.env.depthM, t.env.turbidityNtu, t.env.batteryPct,
+                gUsePots ? " (potentiometers)" : "");
+  out("            target range %lu m, relative speed %.2f m/s\n", (unsigned long)t.rangeM, t.env.speedMs);
+  out(" Physics    sound speed %.1f m/s, absorption %.1f + turbidity %.1f dB/km at %.0f kHz,\n",
+                d.soundSpeed, d.alphaWaterDbKm, d.alphaTurbDbKm, p.fcHz / 1000.0f);
+  out("            loss %.1f dB, noise %.1f dB/Hz, Doppler drift %.2f cycles over the pulse\n",
+                d.tlDb, d.n0Db, d.dopplerCycles);
+#if USE_ML_MODEL
+  out(" Neural network picks, checked by the physics:\n");
+  if (d.flags & sonar::FLAG_ML_USED)
+    out("   profile     %-5s kept: closes the link within the energy allowance\n", PROFILES[t.ml.profile].name);
+  else
+    out("   profile     %-5s replaced by %s: %s\n", t.ml.profile >= 0 ? PROFILES[t.ml.profile].name : "-",
+                  p.name, (d.flags & sonar::FLAG_BEST_EFFORT) ? "no profile closes the link"
+                                                               : "fails the link or costs more than allowed");
+  if (!(d.flags & sonar::FLAG_ML_USED) || t.ml.amp < 0.0f)
+    out("   amplitude   -     set by the physics: %.3f\n", d.ampFrac);
+  else if (d.flags & sonar::FLAG_ML_AMP_RAISED)
+    out("   amplitude   %.3f raised to %.3f: too low for the link\n", t.ml.amp, d.ampFrac);
+  else if (t.ml.amp < d.ampFrac - 5e-4f)
+    out("   amplitude   %.3f raised to %.3f: the minimum drive\n", t.ml.amp, d.ampFrac);
+  else if (t.ml.amp > d.ampFrac + 5e-4f)
+    out("   amplitude   %.3f lowered to %.3f: the most this ping's energy budget allows\n", t.ml.amp, d.ampFrac);
+  else
+    out("   amplitude   %.3f kept: enough for the link\n", t.ml.amp);
+  if (t.forcedMod >= 0)
+    out("   modulation  %-5s not used: forced to %s by the M command (M auto to undo)\n",
+                  modName(t.ml.mod), modName(t.forcedMod));
+  else if (d.flags & sonar::FLAG_ML_MOD_OVERRIDDEN)
+    out("   modulation  %-5s replaced by %s: it cannot take %.2f cycles of Doppler drift\n",
+                  modName(t.ml.mod), modName(d.mod), d.dopplerCycles);
+  else
+    out("   modulation  %-5s kept: it takes %.2f cycles of Doppler drift\n", modName(t.ml.mod), d.dopplerCycles);
+#else
+  out(" Physics only (USE_ML_MODEL 0)\n");
+#endif
+  out(" Result     %s %s, %.0f ms, amplitude %.3f (%.2f W), energy %.2f mJ\n", p.name, modName(mod),
+                p.pulseS * 1000.0f, d.ampFrac, d.txPowerW, d.energyJ * 1000.0f);
+  if (mod == MOD_BPSK)
+    out("            %.0f kHz, Barker-13: 13 chips of %.1f us\n", p.fcHz / 1000.0f, k.chipLen * clkUs);
+  else if (mod == MOD_CW)
+    out("            %.0f kHz tone\n", p.fcHz / 1000.0f);
+  else
+    out("            sweep %.0f -> %.0f kHz\n", (p.fcHz - 0.5f * p.bwHz) / 1000.0f, (p.fcHz + 0.5f * p.bwHz) / 1000.0f);
+  out("            SNR %.1f dB (needs %.1f), reaches %.0f m; energy: cheapest %.2f mJ, allowed %.2f mJ\n",
+                d.snrOutDb, DETECTION_THRESHOLD_DB + LINK_MARGIN_DB, d.maxRangeM,
+                d.energyMinJ * 1000.0f, d.energyAllowanceJ * 1000.0f);
+  out("            %s%s%s\n", (d.flags & sonar::FLAG_LINK_OK) ? "LINK OK" : "LINK FAILS (best effort)",
+                (d.flags & sonar::FLAG_LOW_BATTERY) ? ", LOW BATTERY" : "",
+                (d.flags & sonar::FLAG_INPUT_CLAMPED) ? ", an input was clamped" : "");
+  out(" To FPGA    len %lu clk, ftw_start %lu, ftw_step %ld, win_step %lu, amp %u/4096,\n",
+                (unsigned long)k.lenClk, (unsigned long)k.ftwStart, (long)k.ftwStep, (unsigned long)k.winStep, k.ampQ12);
+  out("            code 0x%04X, chip %lu clk, a pulse every %lu clk (%.0f ms); sent 10 times a second\n",
+                k.code, (unsigned long)k.chipLen, (unsigned long)k.periodClk, k.periodClk * clkUs / 1000.0);
+  out("-----------------------------------------------------------------------------\n");
+  if (gMachine)
+    out("DECISION profile=%s mod=%s amp=%.4f ml_profile=%s ml_mod=%s ml_amp=%.4f flags=0x%02X doppler=%.3f"
+        " len=%lu ftw_start=%lu ftw_step=%ld win_step=%lu amp_q12=%u code=%u chip=%lu period=%lu\n",
+        p.name, modName(mod), d.ampFrac, t.ml.profile >= 0 ? PROFILES[t.ml.profile].name : "-", modName(t.ml.mod),
+        t.ml.amp, d.flags, d.dopplerCycles, (unsigned long)k.lenClk, (unsigned long)k.ftwStart, (long)k.ftwStep,
+        (unsigned long)k.winStep, k.ampQ12, k.code, (unsigned long)k.chipLen, (unsigned long)k.periodClk);
+}
+
+static void printStatus(const Telemetry &t) {
+  const WaveProfile &p = PROFILES[t.dec.profile];
+  out("T=%.1fC S=%.1f D=%.0fm Turb=%.0f Bat=%.0f%% R=%lum v=%.2f | %s %s amp=%.3f E=%.2fmJ SNR=%.1f"
+                " dop=%.2f | %s%s%s%s stale=%lu\n",
+                t.env.tempC, t.env.salinityPpt, t.env.depthM, t.env.turbidityNtu, t.env.batteryPct,
+                (unsigned long)t.rangeM, t.env.speedMs, p.name, modName(t.pkt.modulation), t.dec.ampFrac,
+                t.dec.energyJ * 1000.0f, t.dec.snrOutDb, t.dec.dopplerCycles,
+                (t.dec.flags & sonar::FLAG_LINK_OK) ? "LINK_OK " : "LINK_FAIL ",
+                (t.dec.flags & sonar::FLAG_ML_USED) ? "ML " : (t.dec.flags & sonar::FLAG_ML_OVERRIDDEN) ? "ML_OVERRIDDEN " : "PHYSICS ",
+                (t.dec.flags & sonar::FLAG_ML_AMP_RAISED) ? "AMP_RAISED " : "",
+                (t.dec.flags & sonar::FLAG_ML_MOD_OVERRIDDEN) ? "MOD_OVERRIDDEN " : "",
+                (unsigned long)t.staleCount);
+}
+
+// One line per ping in automatic mode, key=value, for people and for host/demo.py
+static void printPing(const Telemetry &t) {
+  const sonar::Decision &d = t.dec;
+  out("PING seq=%u contact=%c t=%.1f T=%.2f S=%.2f D=%.1f turb=%.1f bat=%.1f R=%lu v=%.2f"
+      " profile=%s mod=%s amp=%.3f ml_profile=%s ml_mod=%s ml_amp=%.3f flags=0x%02X doppler=%.2f\n",
+      t.pkt.seq, t.contact >= 0 ? "ABC"[t.contact] : '-', t.missionS, t.env.tempC, t.env.salinityPpt,
+      t.env.depthM, t.env.turbidityNtu, t.env.batteryPct, (unsigned long)t.rangeM, t.env.speedMs,
+      PROFILES[d.profile].name, modName(t.pkt.modulation), d.ampFrac,
+      t.ml.profile >= 0 ? PROFILES[t.ml.profile].name : "-", modName(t.ml.mod), t.ml.amp, d.flags, d.dopplerCycles);
+}
+
+static void consoleTask(void *) {
   TickType_t last = xTaskGetTickCount();
+  uint32_t tick = 0;
   for (;;) {
     handleSerial();
-    static uint32_t tick = 0;
+    Telemetry t;
+    while (xQueueReceive(qPing, &t, 0) == pdTRUE)
+      if (gSim && t.contact >= 0 && gAsk < 0) printPing(t);
+    const bool have = xQueuePeek(qTelem, &t, 0) == pdTRUE;
+    if (gWaiting && gSim) gWaiting = false;
+    if (gWaiting) {
+      if (have && t.version == gWaitVersion) {
+        gWaiting = false;
+        printReport(t);
+        printPrompt();
+      } else if (millis() - gWaitStartMs > 2000) {
+        gWaiting = false;
+        out("\n  no decision within 2 s (sensor data stale?)\n");
+        printPrompt();
+      }
+    }
     tick += 50;
     if (tick >= LOG_PERIOD_MS) {
       tick = 0;
-      Telemetry t;
-      if (xQueuePeek(qTelem, &t, 0) == pdTRUE) {
-        const WaveProfile &p = PROFILES[t.dec.profile];
-        Serial.printf("T=%.1fC S=%.1f D=%.0fm Turb=%.0f Bat=%.0f%% R=%lum | c=%.1f aW=%.1f aT=%.1fdB/km TL=%.1f N0=%.1f"
-                      " | %s %s fc=%.0fk bw=%.0fk T=%.0fms amp=%.2f P=%.2fW E=%.4fJ SNR=%.1f mrg=%+.1f reach=%.0fm"
-                      " Emin=%.4fJ allow=%.4fJ | %s%s%s%s%s%s stale=%lu\n",
-                      t.env.tempC, t.env.salinityPpt, t.env.depthM, t.env.turbidityNtu, t.env.batteryPct,
-                      (unsigned long)t.rangeM, t.dec.soundSpeed, t.dec.alphaWaterDbKm, t.dec.alphaTurbDbKm,
-                      t.dec.tlDb, t.dec.n0Db, p.name,
-                      MOD_NAMES[t.mod >= 0 ? t.mod : (int)p.mod], p.fcHz / 1000.0f, p.bwHz / 1000.0f, p.pulseS * 1000.0f,
-                      t.dec.ampFrac, t.dec.txPowerW, t.dec.energyJ, t.dec.snrOutDb, t.dec.marginDb, t.dec.maxRangeM,
-                      t.dec.energyMinJ, t.dec.energyAllowanceJ,
-                      (t.dec.flags & sonar::FLAG_LINK_OK)       ? "LINK_OK " : "LINK_FAIL ",
-                      (t.dec.flags & sonar::FLAG_BEST_EFFORT)   ? "BEST_EFFORT " : "",
-                      (t.dec.flags & sonar::FLAG_LOW_BATTERY)   ? "LOW_BAT " : "",
-                      (t.dec.flags & sonar::FLAG_INPUT_CLAMPED) ? "CLAMPED " : "",
-                      (t.dec.flags & sonar::FLAG_ML_USED)       ? "ML "
-                      : (t.dec.flags & sonar::FLAG_ML_OVERRIDDEN) ? "ML_OVERRIDDEN " : "PHYSICS ",
-                      (t.dec.flags & sonar::FLAG_ML_AMP_RAISED) ? "AMP_RAISED " : "",
-                      (unsigned long)t.staleCount);
-      }
+      if (gLive && have && gAsk < 0 && !gWaiting) printStatus(t);
     }
     vTaskDelayUntil(&last, pdMS_TO_TICKS(50));
   }
@@ -283,7 +622,8 @@ void setup() {
   qSensor = xQueueCreate(1, sizeof(SensorSample));
   qPacket = xQueueCreate(1, sizeof(sonar::SonarPacket));
   qTelem  = xQueueCreate(1, sizeof(Telemetry));
-  if (!qSensor || !qPacket || !qTelem) {
+  qPing   = xQueueCreate(8, sizeof(Telemetry));
+  if (!qSensor || !qPacket || !qTelem || !qPing) {
     Serial.println("FATAL: queue allocation failed");
     for (;;) delay(1000);
   }
@@ -291,10 +631,12 @@ void setup() {
   xTaskCreatePinnedToCore(sensorTask,   "sensor",   3072, NULL, PRIO_SENSOR,   NULL, CORE_B);
   xTaskCreatePinnedToCore(decisionTask, "decision", 6144, NULL, PRIO_DECISION, NULL, CORE_B);
   xTaskCreatePinnedToCore(spiTask,      "spi",      3072, NULL, PRIO_SPI,      NULL, CORE_A);
-  xTaskCreatePinnedToCore(loggerTask,   "logger",   5120, NULL, PRIO_LOGGER,   NULL, CORE_A);
+  xTaskCreatePinnedToCore(consoleTask,  "console",  6144, NULL, PRIO_CONSOLE,  NULL, CORE_A);
 
-  Serial.printf("Profiles: %d | band %.0f-%.0f kHz | default range %d m | type '?' for commands\n",
-                NUM_PROFILES, BAND_MIN_HZ / 1000.0f, BAND_MAX_HZ / 1000.0f, DEFAULT_TARGET_RANGE_M);
+  Serial.printf("Profiles: %d | band %.0f-%.0f kHz | %s\n", NUM_PROFILES, BAND_MIN_HZ / 1000.0f,
+                BAND_MAX_HZ / 1000.0f, USE_ML_MODEL ? "neural networks + physics check" : "physics only");
+  Serial.printf("Automatic: simulated water conditions, %d pings per second (? for commands)\n", PING_RATE_HZ);
+  printPrompt();
 }
 
 void loop() {

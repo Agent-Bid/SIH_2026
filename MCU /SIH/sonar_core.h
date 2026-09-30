@@ -18,12 +18,13 @@
 namespace sonar {
 
 /* ---------------------------------------------------------------- types */
-struct Env {                 // the 5 sensor inputs (engineering units)
+struct Env {                 // the sensor inputs (engineering units)
   float tempC;
   float salinityPpt;
   float depthM;
   float turbidityNtu;
   float batteryPct;
+  float speedMs;             // relative speed to the target (magnitude); only the modulation uses it
 };
 
 enum PacketFlags : uint8_t {
@@ -33,7 +34,8 @@ enum PacketFlags : uint8_t {
   FLAG_ML_USED        = 1 << 3,   // ML suggestion accepted (physics-verified)
   FLAG_BEST_EFFORT    = 1 << 4,   // nothing closes the link -> fallback profile
   FLAG_ML_OVERRIDDEN  = 1 << 5,   // ML suggestion rejected by physics
-  FLAG_ML_AMP_RAISED  = 1 << 6    // ML amplitude too low to close the link: physics raised it
+  FLAG_ML_AMP_RAISED  = 1 << 6,   // ML amplitude too low to close the link: physics raised it
+  FLAG_ML_MOD_OVERRIDDEN = 1 << 7 // ML modulation cannot take the motion: physics replaced it
 };
 
 struct Decision {
@@ -55,6 +57,8 @@ struct Decision {
   float    energyBudgetJ;
   float    energyMinJ;         // energy of the cheapest profile that closes the link (0 if none)
   float    energyAllowanceJ;   // most energy the chosen profile may use (the detail/energy rule)
+  int      mod;                // Modulation (the profile's own until chooseModulation())
+  float    dopplerCycles;      // phase drift over the pulse from motion, cycles
 };
 
 /* ------------------------------------------------------------- helpers */
@@ -76,6 +80,7 @@ inline bool sanitizeEnv(Env &e) {
   fix(e.depthM,       DEPTH_MIN_M,     DEPTH_MAX_M);
   fix(e.turbidityNtu, TURBIDITY_MIN_NTU, TURBIDITY_MAX_NTU);
   fix(e.batteryPct,   BATTERY_MIN_PCT, BATTERY_MAX_PCT);
+  fix(e.speedMs,      SPEED_MIN_MS,    SPEED_MAX_MS);
   return changed;
 }
 
@@ -355,6 +360,7 @@ inline Decision decide(Env env, float rangeM, int prevProfile, int mlHint, float
     pUse = a * a * TX_ELEC_POWER_MAX_W;
   }
   d.profile        = chosen;
+  d.mod            = p.mod;
   d.ampFrac        = sqrtf(pUse / TX_ELEC_POWER_MAX_W);
   d.txPowerW       = pUse;
   d.energyJ        = pUse * p.pulseS;
@@ -371,6 +377,47 @@ inline Decision decide(Env env, float rangeM, int prevProfile, int mlHint, float
   d.energyMinJ     = (eMin < INFINITY) ? eMin : 0.0f;
   d.maxRangeM      = maxRangeM(p, env, c, eb);
   return d;
+}
+
+/* ------------------------------------ modulation from motion (Doppler) */
+// Phase drift over one pulse, in cycles: fd x T with fd = k x speed / c x fc (section 4c).
+inline float dopplerCycles(const WaveProfile &p, float speedMs, float c) {
+#if ACTIVE_ECHO_MODE
+  const float k = 2.0f;
+#else
+  const float k = 1.0f;
+#endif
+  return k * fabsf(speedMs) / c * p.fcHz * p.pulseS;
+}
+
+inline bool modulationTolerates(int mod, float cycles) {
+  switch (mod) {
+    case MOD_BPSK:      return cycles <= DOPPLER_BPSK_MAX_CYCLES;
+    case MOD_LFM_CHIRP: return cycles <= DOPPLER_LFM_MAX_CYCLES;
+    case MOD_GEOMETRIC: return true;
+    default:            return false;             // CW is never chosen automatically
+  }
+}
+
+// The least tolerant modulation that takes this drift: BPSK, then LFM, then geometric.
+inline int modulationFor(float cycles) {
+  if (modulationTolerates(MOD_BPSK, cycles))      return MOD_BPSK;
+  if (modulationTolerates(MOD_LFM_CHIRP, cycles)) return MOD_LFM_CHIRP;
+  return MOD_GEOMETRIC;
+}
+
+// Second step of a decision: the modulation for the chosen profile, from the motion.
+// mlMod: the ML model's pick (-1 = none). It is kept when it can take the drift (a more tolerant
+// one than needed is fine), otherwise replaced (FLAG_ML_MOD_OVERRIDDEN).
+inline void chooseModulation(Decision &d, Env env, int mlMod = -1) {
+  if (sanitizeEnv(env)) d.flags |= FLAG_INPUT_CLAMPED;
+  d.dopplerCycles = dopplerCycles(PROFILES[d.profile], env.speedMs, d.soundSpeed);
+  if (mlMod >= 0 && modulationTolerates(mlMod, d.dopplerCycles)) {
+    d.mod = mlMod;
+  } else {
+    if (mlMod >= 0) d.flags |= FLAG_ML_MOD_OVERRIDDEN;
+    d.mod = modulationFor(d.dopplerCycles);
+  }
 }
 
 // Boot-time sanity check of the profile table: band limits, and every profile fits the
@@ -424,9 +471,9 @@ inline uint8_t crc8(const uint8_t *data, size_t len) {
   return crc;
 }
 
-// mod: the operator's modulation override (M command), or -1 for the profile's own.
+// mod: the operator's modulation override (M command), or -1 for the decision's own.
 inline SonarPacket buildPacket(const Decision &d, uint16_t seq, int mod = -1) {
-  const WaveProfile p = withModulation(PROFILES[d.profile], mod);
+  const WaveProfile p = withModulation(PROFILES[d.profile], mod >= 0 ? mod : d.mod);
   SonarPacket k;
   memset(&k, 0, sizeof(k));
   k.sync       = 0xA5;

@@ -1,12 +1,16 @@
 # Waveform-choice model
 
-The ESP32 chooses the waveform with two small neural networks, compiled into the firmware as
-`../ml_model.h` (23.5 KB):
+The ESP32 chooses the waveform with three small neural networks, compiled into the firmware
+as `../ml_model.h` (30 KB of weights):
 
 - **profile network** 6 → 48 → 48 → 6 (ReLU): one score for each profile the rule ever picks
   (X-S, H-S, M-S, L-S, L-M, L-L); the highest wins.
 - **amplitude network** 12 → 48 → 48 → 1: the 6 inputs plus the chosen profile (one-hot) →
   log(amplitude that just closes the link), plus a small safety margin.
+- **modulation network** 16 → 32 → 32 → 3: temperature, salinity, depth, log10(speed + 0.01)
+  and the profile (one-hot of 12) → LFM, geometric or BPSK: the Doppler rule in
+  `sonar_config.h` section 4c (drift over the pulse ≤ 0.25 cycles → BPSK, ≤ 1 → LFM, else
+  geometric). Trained on 200,000 random (conditions, speed, profile) triples.
 
 **Inputs**: temperature (°C), salinity (ppt), depth (m), turbidity (NTU), battery (%), target
 range (m); the range is fed as log10(range), and every input is standardised.
@@ -21,7 +25,8 @@ Set `USE_ML_MODEL 0` in `adaptive_sonar.ino` for physics only.
 
 **Results** (`REPORT.md`): the profile agrees with the physics on about 99.2–99.4 % of
 scenarios and 0.5 % of picks are overridden; the amplitude is within 1.8 % (median) of what is
-needed and costs 1.6–3.4 % more energy than the minimum. XGBoost and a decision tree are
+needed and costs 1.6–3.4 % more energy than the minimum; the modulation agrees on 99.7 % (0.2 %
+overridden, all at a threshold). XGBoost and a decision tree are
 trained on the same data for comparison: the boundaries are smooth curves, which the network
 fits with far fewer parameters. The labels come from the physics, so the model reproduces the
 physics; it cannot be more accurate than it.
@@ -34,7 +39,7 @@ ml/.venv/bin/python ml/train.py          # writes ../ml_model.h, test_vectors.cs
 Retrain after any change to `sonar_config.h` that affects the choice (profiles, power,
 thresholds, the detail-vs-energy knobs, sensor ranges), then run the firmware tests:
 `tools/test_core.cpp` checks that the C networks give the Python models' profile and amplitude
-on `test_vectors.csv`.
+on `test_vectors.csv`, and modulation on `test_vectors_mod.csv`.
 
 **Later, real data**: the model only beats the physics once it learns from measurements.
 Log the inputs, the chosen profile and the measured result of each ping (for example the

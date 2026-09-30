@@ -1,17 +1,33 @@
 # Adaptive sonar waveform generator (Tang Nano 9K + ESP32-S3)
 
-An ESP32-S3 reads the water conditions, runs an acoustics model and picks a sonar waveform;
-it sends the choice over SPI to a Tang Nano 9K FPGA, which generates the pulses sample by
-sample at 50.14 MHz for an 8-bit DAC. Four modulations, 100–500 kHz: CW tone, LFM chirp,
-geometric sweep and BPSK (Barker-13), each with a Hann window and an amplitude.
+An ESP32-S3 takes the water conditions (simulated for now), runs an acoustics model and three
+small neural networks, and picks a sonar waveform for every ping, 6 a second: the frequency
+band and pulse length, the amplitude, and the modulation (BPSK, LFM or geometric, from how fast
+the target moves). It sends the choice over SPI to a Tang Nano 9K FPGA, which generates the
+pulses sample by sample at 50.14 MHz for an 8-bit DAC, each with a Hann window.
 
 A PC can stand in for the ESP32 over the Tang Nano's USB UART, and can capture pulses back
-from the FPGA to check them sample for sample against a Python golden model.
+from the FPGA (one, or every ping) to check them sample for sample against a Python golden
+model.
 
 **Full project details** (design, packet format, pins, toolchain quirks, status, open items):
 [`AGENTS.md`](AGENTS.md). ESP32 firmware and its physics write-up: `MCU /SIH/`.
 
 ## Use it
+
+**Demo**: power the ESP32 (it starts pinging on its own), plug the Tang Nano into the PC, then
+
+```
+python3 host/demo.py                  # one second: 6 pings on one graph, with the conditions behind each
+```
+
+It streams 6 consecutive pings from the FPGA, checks each against the golden model, and plots
+them at their real times over one second (grey = baseline, no output), with a table of the
+water conditions, the waveform chosen, what the neural networks picked, and the check result
+(`sim/out/demo.png`). The ESP32's USB log is used if it is connected; otherwise the conditions
+are recomputed from each packet's number (`host/water_sim.py`).
+
+**Other tools**:
 
 ```
 tn9k load                                                        # build + load the FPGA
@@ -26,12 +42,15 @@ python3 host/capture.py --request                                # capture what 
 
 - `--capture` asks the board for the next pulse, checks it against the golden model and saves
   a plot in `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the expected sweep).
+  Long pulses are captured whole by keeping one sample in 4, 16 or 64.
 - `wavegen.py` pulses are 13,000 clocks (259 µs); sweeps go up from `fc - bw/2` to
   `fc + bw/2`; BPSK uses Barker-13 at 1,000 clocks per chip. Other options: `--amp 0..1`,
   `--period <clocks>`, `--port`, `--dry-run`.
-- With the ESP32 connected, its packets (10 per second) replace the PC's settings; use
-  `capture.py --request` to see what it chose. On the ESP32's serial port, `M geo`,
-  `M bpsk`, `M lfm`, `M cw` or `M auto` picks the modulation, `R 450` the target range.
+- With the ESP32 connected, its packets (one per ping) replace the PC's settings; use
+  `capture.py --request` to see what it chose. The ESP32's serial console
+  (`python3 host/esp_console.py`): `A` automatic (simulated conditions, the default),
+  `W` type the inputs, `M geo|bpsk|lfm|cw|auto` force a modulation, `R 450` the target range.
+- The PC talks to the FPGA at 3 Mbaud (`/dev/ttyUSB1`).
 - On the board: **S1** steps through three presets (chirp, geometric, BPSK), **S2** captures
   the next pulse (listen with `python3 host/capture.py`).
 - **Oscilloscope** (no DAC needed): pin 40 → 1 kΩ → probe point, 100 pF from the probe point
@@ -43,7 +62,7 @@ python3 host/capture.py --request                                # capture what 
 ## Test in simulation
 
 ```
-sim/all        # 10 testbenches, ALL PASS
+sim/all        # 11 testbenches, ALL PASS
 ```
 
 `sim/top_tb.v` simulates the whole board: settings over the UART, a pretend ESP32 on SPI
@@ -61,5 +80,7 @@ by `host/capture.py`.
   the pause after each burst instead of CS (the CS wire does not work on these boards; see
   `AGENTS.md`).
 - 2026-09-30: with the oscilloscope outputs added and `scale` split into two clocks (the
-  single-clock multiply failed on the chip), ESP32 and PC captures were all bit-exact. This
-  build is in the FPGA's flash.
+  single-clock multiply failed on the chip), ESP32 and PC captures were all bit-exact.
+- 2026-09-30: the demo: simulated conditions on the ESP32, 6 pings a second, each a new
+  decision; 6 consecutive pings streamed from the FPGA, all bit-exact. This build is in the
+  FPGA's flash.

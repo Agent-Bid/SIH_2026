@@ -12,7 +12,7 @@ module top_tb;
 
     localparam BAUD_DIV = 8;
     localparam CAP_BITS = 11;                          // 2048 samples per capture
-    localparam BYTES    = 37 + 2 * (1 << CAP_BITS);    // one capture
+    localparam BYTES    = 43 + 2 * (1 << CAP_BITS);    // one capture
     localparam GROUP    = 63;                          // SET frame (60) + CAPTURE frame (3)
     localparam PKT      = 57;                          // one ESP32 packet
     localparam SCK_HALF = 250;                         // ns: SPI at 2 MHz, like the ESP32

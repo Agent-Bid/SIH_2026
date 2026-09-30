@@ -132,6 +132,28 @@ def amplitude_needed(env, R):
     return [math.sqrt(evaluate(p, env, c, R, eb)["p_req"] / C["TX_ELEC_POWER_MAX_W"]) for p in PROFILES]
 
 
+# ------------------------------------------------ modulation from motion
+MOD_CW, MOD_LFM, MOD_GEO, MOD_BPSK = 0, 1, 2, 3
+MOD_NAMES = {MOD_CW: "cw", MOD_LFM: "lfm", MOD_GEO: "geo", MOD_BPSK: "bpsk"}
+
+def doppler_cycles(p, v, c):
+    """Phase drift over one pulse from motion: fd x T, fd = k x speed / c x fc (k = 2 in echo mode)."""
+    k = 2.0 if int(C.get("ACTIVE_ECHO_MODE", 0)) else 1.0
+    return k * abs(v) / c * p["fc"] * p["T"]
+
+def tolerates(mod, cycles):
+    if mod == MOD_BPSK: return cycles <= C["DOPPLER_BPSK_MAX_CYCLES"]
+    if mod == MOD_LFM:  return cycles <= C["DOPPLER_LFM_MAX_CYCLES"]
+    return mod == MOD_GEO
+
+def modulation_for(cycles):
+    """Same as sonar::modulationFor(): the least tolerant modulation that takes the drift."""
+    for m in (MOD_BPSK, MOD_LFM):
+        if tolerates(m, cycles):
+            return m
+    return MOD_GEO
+
+
 # ------------------------------------------------------------ dataset maker
 def generate_dataset(n, seed, out_csv):
     """Uniform random scenarios over the sensor ranges + target range -> physics label.
@@ -139,7 +161,7 @@ def generate_dataset(n, seed, out_csv):
     rnd = random.Random(seed)
     cols = ["temperature","salinity","depth","turbidity","battery","range",
             "sound_speed","selected_profile","profile_name","link_ok","fc_hz","bw_hz","pulse_s",
-            "amplitude_frac","tx_power_w","snr_out_db"]
+            "amplitude_frac","tx_power_w","snr_out_db","speed","modulation"]
     with open(out_csv, "w", newline="") as f:
         w = csv.writer(f); w.writerow(cols)
         for _ in range(n):
@@ -149,12 +171,14 @@ def generate_dataset(n, seed, out_csv):
                        turb=rnd.uniform(C["TURBIDITY_MIN_NTU"], C["TURBIDITY_MAX_NTU"]),
                        soc=rnd.uniform(C["BATTERY_MIN_PCT"], C["BATTERY_MAX_PCT"]))
             R = rnd.uniform(C["MIN_TARGET_RANGE_M"], C["MAX_TARGET_RANGE_M"])
+            v = rnd.uniform(C["SPEED_MIN_MS"], C["SPEED_MAX_MS"])
             i, ok, ev, c = decide(env, R, prev=-1)
             p = PROFILES[i]
             w.writerow([f"{env['T']:.4f}", f"{env['S']:.4f}", f"{env['D']:.3f}", f"{env['turb']:.4f}",
                         f"{env['soc']:.4f}", f"{R:.3f}", f"{c:.4f}", i, p["name"], int(ok),
                         int(p["fc"]), int(p["bw"]), p["T"], f"{ev['amp']:.5f}", f"{ev['p_use']:.5f}",
-                        f"{ev['snr']:.4f}"])
+                        f"{ev['snr']:.4f}", f"{v:.4f}",
+                        MOD_NAMES[modulation_for(doppler_cycles(p, v, c))]])
     print(f"wrote {n} rows -> {out_csv}")
 
 if __name__ == "__main__":

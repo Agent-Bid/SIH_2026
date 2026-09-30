@@ -5,18 +5,22 @@ sonar_config.h as the firmware). For each random scenario the physics gives:
   - the profile it picks: the finest one that closes the link within the energy allowance
     (the detail-vs-energy rule in sonar_config.h, section 4b);
   - for every profile, the amplitude that just closes the link.
-Two small neural networks learn these from the six values the firmware hands to mlSelect():
-temperature, salinity, depth, turbidity, battery and target range.
+  - the modulation the motion allows for a profile (the Doppler rule, sonar_config.h section 4c).
+Three small neural networks learn these. The first two take the six values the firmware hands
+to mlSelect(): temperature, salinity, depth, turbidity, battery and target range.
   classifier: 6 -> 48 -> 48 -> one score per profile the rule ever picks; the highest wins;
   amplitude:  6 inputs + the profile (one-hot) -> 48 -> 48 -> log(amplitude that just closes
-              the link, before the 5 % floor), trained only where that amplitude matters.
-XGBoost and a decision tree are trained on the same classification data as a comparison.
+              the link, before the 5 % floor), trained only where that amplitude matters;
+  modulation: temperature, salinity, depth, relative speed + the profile (one-hot) -> 32 -> 32
+              -> one score each for LFM, geometric and BPSK; the highest wins.
+XGBoost and a decision tree are trained on the same profile data as a comparison.
 
   ml/.venv/bin/python ml/train.py              # full run (~5 minutes on a laptop CPU)
   ml/.venv/bin/python ml/train.py --quick      # small data, for a fast check
 
-Writes ../ml_model.h (both networks as C, next to the sketch), ml/test_vectors.csv (inputs,
-expected class, score margin and amplitude, for tools/test_core.cpp) and ml/REPORT.md.
+Writes ../ml_model.h (the networks as C, next to the sketch), ml/test_vectors.csv (inputs,
+expected class, score margin and amplitude) and ml/test_vectors_mod.csv (the same for the
+modulation), both for tools/test_core.cpp, and ml/REPORT.md.
 Later, the same code can learn from measured results: replace make_set()'s labels with logged
 field data.
 """
@@ -43,6 +47,8 @@ C = phys.C
 N_CLASSES = len(phys.PROFILES)
 NAMES = [p["name"] for p in phys.PROFILES]
 SEED_TRAIN, SEED_TEST_UNIFORM, SEED_TEST_LOG = 11, 22, 33
+SEED_MOD_TRAIN, SEED_MOD_TEST = 44, 55
+MOD_CLASSES = [phys.MOD_LFM, phys.MOD_GEO, phys.MOD_BPSK]
 
 
 # ------------------------------------------------------------------ data
@@ -76,6 +82,50 @@ def make_set(n, seed, log_range_share):
         y[i], link_ok[i] = k, ok
         amp[i] = phys.amplitude_needed(env, R)
     return X, y, link_ok, amp
+
+
+def mod_set(n, seed):
+    """n (conditions, speed, profile) triples labelled with the modulation the Doppler rule picks.
+    The speed is 0 for a tenth of them and log-uniform from 1 cm/s up to the maximum for the rest;
+    the profile is any of the 12 (the physics can end up on any of them)."""
+    rnd = random.Random(seed)
+    X = np.empty((n, 4), dtype=np.float32)
+    k = np.empty(n, dtype=np.int32)
+    y = np.empty(n, dtype=np.int32)
+    cyc = np.empty(n, dtype=np.float64)
+    f = lambda v: float(np.float32(v))
+    for i in range(n):
+        T = f(rnd.uniform(C["TEMP_MIN_C"], C["TEMP_MAX_C"]))
+        S = f(rnd.uniform(C["SALINITY_MIN_PPT"], C["SALINITY_MAX_PPT"]))
+        D = f(rnd.uniform(C["DEPTH_MIN_M"], C["DEPTH_MAX_M"]))
+        v = 0.0 if rnd.random() < 0.1 else f(math.exp(rnd.uniform(math.log(0.01), math.log(C["SPEED_MAX_MS"]))))
+        k[i] = rnd.randrange(N_CLASSES)
+        cyc[i] = phys.doppler_cycles(phys.PROFILES[k[i]], v, phys.mackenzie(T, S, D))
+        X[i] = (T, S, D, v)
+        y[i] = phys.modulation_for(cyc[i])
+    return X, k, y, cyc
+
+
+SPEED_EPS = 0.01                                  # speed is fed as log10(speed + 1 cm/s)
+
+
+def mod_net_inputs(X):
+    Z = X.astype(np.float64).copy()
+    Z[:, 3] = np.log10(Z[:, 3] + SPEED_EPS)
+    return Z
+
+
+def mod_inputs(scaler, X, k):
+    oh = np.zeros((len(X), N_CLASSES), dtype=np.float32)
+    oh[np.arange(len(X)), k] = 1
+    return np.hstack([((mod_net_inputs(X) - scaler.mean_) / scaler.scale_).astype(np.float32), oh])
+
+
+def mod_forward32(model, scaler, X, k):
+    x = mod_inputs(scaler, X, k)
+    for W, b in zip(model.coefs_[:-1], model.intercepts_[:-1]):
+        x = np.maximum(x @ W.astype(np.float32) + b.astype(np.float32), np.float32(0))
+    return x @ model.coefs_[-1].astype(np.float32) + model.intercepts_[-1].astype(np.float32)
 
 
 def acceptable(x, k):
@@ -176,7 +226,7 @@ def amp_out(amp_model, scaler, X, k, used, margin):
     return np.exp(amp_forward32(amp_model, scaler, X, k, used) + np.float32(margin)).astype(np.float32)
 
 
-def export_c(clf, amp_model, amp_margin, scaler, path, info):
+def export_c(clf, amp_model, amp_margin, scaler, mod_model, mod_scaler, path, info):
     def fl(v):                                        # a C float literal: 3.0f, not 3f
         t = f"{np.float32(v).item():.9g}"
         return (t if any(c in t for c in ".en") else t + ".0") + "f"
@@ -188,15 +238,19 @@ def export_c(clf, amp_model, amp_margin, scaler, path, info):
         return f"static const float {name}[{a.shape[0]}][{a.shape[1]}] = {{\n{rows}\n}};\n"
     sizes = [clf.coefs_[0].shape[0]] + [W.shape[1] for W in clf.coefs_]
     asizes = [amp_model.coefs_[0].shape[0]] + [W.shape[1] for W in amp_model.coefs_]
+    msizes = [mod_model.coefs_[0].shape[0]] + [W.shape[1] for W in mod_model.coefs_]
     assert len(sizes) == 4 and asizes == [sizes[0] + sizes[3], sizes[1], sizes[2], 1]
+    assert len(msizes) == 4 and msizes[0] == 4 + N_CLASSES and list(mod_model.classes_) == MOD_CLASSES
     with open(path, "w") as f:
         f.write(f"""// Generated by ml/train.py -- do not edit. {info}
-// Waveform-choice model: two neural networks, {' -> '.join(map(str, sizes))} (profile) and
-// {' -> '.join(map(str, asizes))} (amplitude), ReLU, trained on the physics twin's decisions.
-// Inputs in the firmware's units:
+// Waveform-choice model: three neural networks, {' -> '.join(map(str, sizes))} (profile),
+// {' -> '.join(map(str, asizes))} (amplitude) and {' -> '.join(map(str, msizes))} (modulation), ReLU, trained on the
+// physics twin's decisions. Inputs in the firmware's units:
 //   temperature C, salinity ppt, depth m, turbidity NTU, battery %, target range m.
-// ml_predict_profile()   -> the profile 0..{N_CLASSES - 1} (the classifier's highest score)
-// ml_predict_amplitude() -> the drive amplitude 0..1 for that profile (the physics raises it if short)
+// ml_predict_profile()    -> the profile 0..{N_CLASSES - 1} (the classifier's highest score)
+// ml_predict_amplitude()  -> the drive amplitude 0..1 for that profile (the physics raises it if short)
+// ml_predict_modulation() -> LFM, geometric or BPSK for a profile, from temperature, salinity, depth
+//                            and the relative speed m/s (the physics replaces it if it cannot take the motion)
 #pragma once
 #include <math.h>
 
@@ -218,27 +272,37 @@ static const int ML_CLASSES[ML_NCLASS] = {{ {", ".join(str(int(c)) for c in clf.
         for i, (W, b) in enumerate(zip(amp_model.coefs_, amp_model.intercepts_), 1):
             f.write(arr(f"MA_W{i}", W) + arr(f"MA_B{i}", b))
         f.write(f"static const float MA_MARGIN = {fl(amp_margin)};\n")
+        f.write(f"""
+// Modulation network: temperature, salinity, depth, log10(speed + {SPEED_EPS:g}), each (x - MM_MEAN) / MM_SCALE,
+// then a one-hot of the profile (0..{N_CLASSES - 1}) -> one score per entry of MM_CLASSES (Modulation values)
+static const int MM_IN = {msizes[0]}, MM_H1 = {msizes[1]}, MM_H2 = {msizes[2]}, MM_NCLASS = {msizes[3]};
+static const int MM_CLASSES[MM_NCLASS] = {{ {", ".join(str(int(c)) for c in mod_model.classes_)} }};
+static const float MM_SPEED_EPS = {fl(SPEED_EPS)};
+""")
+        f.write(arr("MM_MEAN", mod_scaler.mean_) + arr("MM_SCALE", mod_scaler.scale_))
+        for i, (W, b) in enumerate(zip(mod_model.coefs_, mod_model.intercepts_), 1):
+            f.write(arr(f"MM_W{i}", W) + arr(f"MM_B{i}", b))
         f.write("""
 // one network: NIN normalised inputs -> N outputs
-template <int NIN, int N>
+template <int NIN, int H1, int H2, int N>
 inline void ml_forward(const float x[NIN],
-                       const float W1[NIN][ML_H1], const float B1[ML_H1],
-                       const float W2[ML_H1][ML_H2], const float B2[ML_H2],
-                       const float W3[ML_H2][N], const float B3[N], float out[N]) {
-  float h1[ML_H1], h2[ML_H2];
-  for (int j = 0; j < ML_H1; j++) {
+                       const float W1[NIN][H1], const float B1[H1],
+                       const float W2[H1][H2], const float B2[H2],
+                       const float W3[H2][N], const float B3[N], float out[N]) {
+  float h1[H1], h2[H2];
+  for (int j = 0; j < H1; j++) {
     float s = B1[j];
     for (int i = 0; i < NIN; i++) s += x[i] * W1[i][j];
     h1[j] = s > 0.0f ? s : 0.0f;
   }
-  for (int j = 0; j < ML_H2; j++) {
+  for (int j = 0; j < H2; j++) {
     float s = B2[j];
-    for (int i = 0; i < ML_H1; i++) s += h1[i] * W2[i][j];
+    for (int i = 0; i < H1; i++) s += h1[i] * W2[i][j];
     h2[j] = s > 0.0f ? s : 0.0f;
   }
   for (int j = 0; j < N; j++) {
     float s = B3[j];
-    for (int i = 0; i < ML_H2; i++) s += h2[i] * W3[i][j];
+    for (int i = 0; i < H2; i++) s += h2[i] * W3[i][j];
     out[j] = s;
   }
 }
@@ -251,7 +315,7 @@ inline void ml_normalise(const float in[ML_IN], float x[ML_IN]) {
 inline int ml_predict_profile(const float in[ML_IN]) {
   float x[ML_IN], score[ML_NCLASS];
   ml_normalise(in, x);
-  ml_forward<ML_IN, ML_NCLASS>(x, ML_W1, ML_B1, ML_W2, ML_B2, ML_W3, ML_B3, score);
+  ml_forward<ML_IN, ML_H1, ML_H2, ML_NCLASS>(x, ML_W1, ML_B1, ML_W2, ML_B2, ML_W3, ML_B3, score);
   int best = 0;
   for (int j = 1; j < ML_NCLASS; j++) if (score[j] > score[best]) best = j;
   return ML_CLASSES[best];
@@ -265,15 +329,31 @@ inline float ml_predict_amplitude(const float in[ML_IN], int profile) {
   for (int j = 0; j < ML_NCLASS; j++) { x[ML_IN + j] = 0.0f; if (ML_CLASSES[j] == profile) c = j; }
   if (c < 0) return -1.0f;
   x[ML_IN + c] = 1.0f;
-  ml_forward<MA_IN, 1>(x, MA_W1, MA_B1, MA_W2, MA_B2, MA_W3, MA_B3, logamp);
+  ml_forward<MA_IN, ML_H1, ML_H2, 1>(x, MA_W1, MA_B1, MA_W2, MA_B2, MA_W3, MA_B3, logamp);
   const float a = expf(logamp[0] + MA_MARGIN);
   return a > 1.0f ? 1.0f : a;
+}
+
+// in: temperature C, salinity ppt, depth m, relative speed m/s. -1 for a profile out of range.
+inline int ml_predict_modulation(const float in[4], int profile) {
+  if (profile < 0 || profile >= MM_IN - 4) return -1;
+  float x[MM_IN], score[MM_NCLASS];
+  for (int i = 0; i < 4; i++) {
+    const float v = (i == 3) ? log10f((in[i] < 0.0f ? -in[i] : in[i]) + MM_SPEED_EPS) : in[i];
+    x[i] = (v - MM_MEAN[i]) / MM_SCALE[i];
+  }
+  for (int j = 4; j < MM_IN; j++) x[j] = 0.0f;
+  x[4 + profile] = 1.0f;
+  ml_forward<MM_IN, MM_H1, MM_H2, MM_NCLASS>(x, MM_W1, MM_B1, MM_W2, MM_B2, MM_W3, MM_B3, score);
+  int best = 0;
+  for (int j = 1; j < MM_NCLASS; j++) if (score[j] > score[best]) best = j;
+  return MM_CLASSES[best];
 }
 
 }  // namespace ml
 """)
     count = lambda m: sum(W.size for W in m.coefs_) + sum(b.size for b in m.intercepts_)
-    return count(clf), count(amp_model)
+    return count(clf), count(amp_model), count(mod_model)
 
 
 # ------------------------------------------------------------------ main
@@ -393,6 +473,36 @@ def main():
     log("Raised: the ML's amplitude was short, so the physics raised it (FLAG_ML_AMP_RAISED). Extra energy:")
     log("what the ML's amplitude costs above the minimum (energy goes with amplitude squared).")
 
+    # ---- modulation: LFM / geometric / BPSK from the motion, for a given profile
+    n_mod = 40_000 if a.quick else 200_000
+    Xm, km, ym, _ = mod_set(n_mod, SEED_MOD_TRAIN)
+    Xmt, kmt, ymt, cmt = mod_set(n_test, SEED_MOD_TEST)
+    mod_scaler = StandardScaler().fit(mod_net_inputs(Xm))
+    t0 = time.time()
+    mod_model = MLPClassifier(hidden_layer_sizes=(32, 32), max_iter=400, early_stopping=True,
+                              n_iter_no_change=20, random_state=0)
+    mod_model.fit(mod_inputs(mod_scaler, Xm, km), ym)
+    dt = time.time() - t0
+    pm = mod_model.classes_[mod_forward32(mod_model, mod_scaler, Xmt, kmt).argmax(1)]
+    kept = np.array([phys.tolerates(int(p), c) for p, c in zip(pm, cmt)])
+    mname = {phys.MOD_LFM: "LFM", phys.MOD_GEO: "geometric", phys.MOD_BPSK: "BPSK"}
+    log()
+    log("## Modulation")
+    log()
+    log(f"Network {4 + N_CLASSES}-32-32-3 (temperature, salinity, depth, log10(speed + {SPEED_EPS:g} m/s) + the "
+        f"profile, one-hot) trained on {n_mod:,} random (conditions, speed, profile) triples in {dt:.0f} s. "
+        f"Rule: BPSK while the Doppler drift over the pulse is at most {C['DOPPLER_BPSK_MAX_CYCLES']:g} cycles, "
+        f"LFM up to {C['DOPPLER_LFM_MAX_CYCLES']:g}, geometric beyond.")
+    log()
+    log(f"On {n_test:,} test triples: agreement {np.mean(pm == ymt):.2%}; kept by the physics {kept.mean():.2%} "
+        f"(overridden {1 - kept.mean():.2%}: the pick cannot take the motion). Per class: " + ", ".join(
+            f"{mname[c]} {np.mean(pm[ymt == c] == c):.1%}" for c in MOD_CLASSES) + ".")
+    miss = pm != ymt
+    if miss.any():
+        near = np.minimum(np.abs(np.log(cmt[miss] / C["DOPPLER_BPSK_MAX_CYCLES"])),
+                          np.abs(np.log(cmt[miss] / C["DOPPLER_LFM_MAX_CYCLES"])))
+        log(f"The disagreements sit at the thresholds: median {np.median(near):.1%} away from one (in drift).")
+
     # ---- export and the C test vectors
     Xt = np.concatenate([tests["uniform range"][0][:3000], tests["log range"][0][:3000]])
     s32 = forward32(clf, scaler, Xt)
@@ -404,13 +514,22 @@ def main():
     log(f"float32 (as on the ESP32) vs float64: same profile on {same:.2%} of {len(Xt):,} vectors.")
     info = (f"{name}; profile agreement with the physics {m['uniform range']['agreement']:.2%} (uniform range) / "
             f"{m['log range']['agreement']:.2%} (log range)")
-    n1, n2 = export_c(clf, amp_model, amp_margin, scaler, os.path.join(HERE, "..", "ml_model.h"), info)
+    n1, n2, n3 = export_c(clf, amp_model, amp_margin, scaler, mod_model, mod_scaler,
+                          os.path.join(HERE, "..", "ml_model.h"), info)
     with open(os.path.join(HERE, "test_vectors.csv"), "w") as f:
         f.write("# temperature,salinity,depth,turbidity,battery,range,profile,score margin,amplitude (float32)\n")
         for x, k, t, av in zip(Xt, k32, top2, a32):
             f.write(",".join(f"{np.float32(v).item():.9g}" for v in x) + f",{k},{t[1] - t[0]:.6g},{av:.7g}\n")
-    log(f"Wrote ml_model.h ({n1 + n2:,} weights = {(n1 + n2) * 4 / 1024:.1f} KB) and ml/test_vectors.csv "
-        f"({len(Xt):,} vectors).")
+    sm = mod_forward32(mod_model, mod_scaler, Xmt[:6000], kmt[:6000])
+    top2m = np.sort(sm, axis=1)[:, -2:]
+    with open(os.path.join(HERE, "test_vectors_mod.csv"), "w") as f:
+        f.write("# temperature,salinity,depth,speed,profile,modulation,score margin (float32)\n")
+        for x, k, s_, t in zip(Xmt[:6000], kmt[:6000], sm, top2m):
+            f.write(",".join(f"{np.float32(v).item():.9g}" for v in x)
+                    + f",{k},{mod_model.classes_[s_.argmax()]},{t[1] - t[0]:.6g}\n")
+    n = n1 + n2 + n3
+    log(f"Wrote ml_model.h ({n:,} weights = {n * 4 / 1024:.1f} KB), ml/test_vectors.csv ({len(Xt):,} vectors) "
+        f"and ml/test_vectors_mod.csv (6,000 vectors).")
 
     with open(os.path.join(HERE, "REPORT.md"), "w") as f:
         f.write("# Waveform-choice model: training report\n\nGenerated by `ml/train.py`.\n\n")

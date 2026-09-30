@@ -1,5 +1,6 @@
-// Capture buffer: after arm, records 2^N_BITS samples starting at the next trigger,
-// then sends the header and the samples to a UART transmitter, one byte at a time.
+// Capture buffer: after arm, records 2^N_BITS samples starting at the next trigger, keeping
+// every 2^shift-th sample (so a long pulse fits), then sends the header and the samples to a
+// UART transmitter, one byte at a time.
 // Samples go out as 16-bit little-endian (sign-extended from 12 bits). The header is
 // frozen when the pulse starts, so it always describes the settings of the captured pulse.
 module capture #(
@@ -9,8 +10,10 @@ module capture #(
     input  wire                   clk,
     input  wire                   rst,
     input  wire                   arm,        // one clock: capture the next pulse
+    input  wire                   stream,     // re-arm after each capture has been sent
     input  wire                   trigger,    // one clock: a pulse starts now
     input  wire signed [11:0]     sample,
+    input  wire [3:0]             shift,      // keep one sample in 2^shift (0..10), taken at the trigger
     input  wire [HDR_BYTES*8-1:0] header,     // byte 0 in bits [7:0]
     output reg  [7:0]             tx_data,
     output reg                    tx_valid,
@@ -27,6 +30,9 @@ module capture #(
     reg [7:0]        hdr_i;
     reg [HDR_BYTES*8-1:0] hdr;
     reg              high_byte;
+    reg  [3:0]       shift_r;
+    reg  [9:0]       div;                     // clocks since the trigger, mod 1024
+    wire [10:0]      mask = (11'd1 << shift_r) - 11'd1;
 
     // The buffer: banks of 1024 x 12, one block RAM each (the 1K x 18 mode). Apycula 0.33
     // gets the deep, narrow block RAM modes (16K x 1, 4K x 4) wrong on the chip, so the
@@ -79,16 +85,21 @@ module capture #(
                     wr_addr <= 0;
                     wr_data <= sample;
                     addr    <= 1;
+                    shift_r <= shift;
+                    div     <= 1;
                     state   <= RECORD;
                 end
             RECORD: begin
-                wr_en     <= 1'b1;
-                wr_addr   <= addr;
-                wr_data   <= sample;
-                addr      <= addr + 1;
-                if (&addr) begin
-                    hdr_i <= 0;
-                    state <= SEND_HDR;
+                div <= div + 1;
+                if ((div & mask[9:0]) == 0) begin
+                    wr_en     <= 1'b1;
+                    wr_addr   <= addr;
+                    wr_data   <= sample;
+                    addr      <= addr + 1;
+                    if (&addr) begin
+                        hdr_i <= 0;
+                        state <= SEND_HDR;
+                    end
                 end
             end
             SEND_HDR:
@@ -113,7 +124,7 @@ module capture #(
                         high_byte <= 1'b0;
                         addr      <= addr + 1;
                         if (&addr)
-                            state <= IDLE;
+                            state <= stream ? ARMED : IDLE;
                     end
                 end
             default:

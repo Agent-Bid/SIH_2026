@@ -2,7 +2,8 @@
 // over the USB UART (host/wavegen.py), which sends the very same packet inside a UART frame.
 //   S1: step through three built-in presets: LFM chirp 150 -> 500 kHz, geometric sweep
 //       150 -> 500 kHz, BPSK Barker-13 at 300 kHz (the ESP32 overrides them 10 times a second)
-//   S2: capture the next pulse and send it back (host/capture.py, or wavegen.py --capture)
+//   S2: capture the next pulse and send it back (host/capture.py, or wavegen.py --capture);
+//       the PC can also ask for every pulse (stream mode, host/demo.py)
 // LEDs (on = 1): 0 BPSK, 1 armed, 2 recording or sending, 3 toggles on every good SPI packet,
 //                4 pulse active, 5 geometric sweep
 //
@@ -12,7 +13,7 @@
 //   chipLen[31:0] periodClk[31:0]
 module top #(
     parameter CAP_BITS = 14,        // capture 2^14 = 16384 samples
-    parameter BAUD_DIV = 435,       // 50.14 MHz / 435 = 115200 baud
+    parameter BAUD_DIV = 17,        // 50.14 MHz / 17 = 2.95 Mbaud (the PC uses 3 Mbaud: 1.7 % apart, fine for a UART)
     parameter BTN_BITS = 20
 ) (
     input  wire       clk,          // 27 MHz oscillator
@@ -70,12 +71,13 @@ module top #(
     wire [7:0]             rx_data;
     wire                   rx_valid;
     wire [PKT_BYTES*8-1:0] uart_pkt;
-    wire                   uart_valid, capture_req;
+    wire                   uart_valid, capture_req, stream_on, stream_off;
     uart_rx #(.DIV(BAUD_DIV)) u_rx (.clk(clk50), .rst(rst), .rx(uart_rx),
                                     .data(rx_data), .valid(rx_valid));
     cmd_rx #(.BYTES(PKT_BYTES)) u_cmd (.clk(clk50), .rst(rst), .rx_data(rx_data), .rx_valid(rx_valid),
                                        .settings(uart_pkt), .settings_valid(uart_valid),
-                                       .capture_req(capture_req));
+                                       .capture_req(capture_req), .stream_on(stream_on),
+                                       .stream_off(stream_off));
 
     reg from_spi = 1'b0;
     always @(posedge clk50)
@@ -125,6 +127,17 @@ module top #(
     wire [31:0]         period = cur[SET_BITS-1 -: 32];
     wire                start  = (timer == 0) && (period != 0);
 
+    // the packet's flags, profile and sequence number travel with its settings, for the capture header
+    reg  [31:0]         pending_tag = 0, cur_tag = 0;
+    always @(posedge clk50) begin
+        if (pkt_ok)
+            pending_tag <= {pkt[7*8 +: 8], pkt[4*8 +: 8], pkt[2*8 +: 16]};
+        else if (preset_press)
+            pending_tag <= 32'd0;
+        if (!active && !start)
+            cur_tag <= pending_tag;
+    end
+
     always @(posedge clk50) begin
         if (pkt_ok)
             pending <= pkt_settings;
@@ -161,19 +174,41 @@ module top #(
     sigma_delta u_sd (.clk(clk50), .rst(rst), .in(out), .out(scope_sd));
     assign scope_trig = active;
 
-    // ---- Capture one pulse and send it back. Header, 37 bytes (host/capture.py):
-    //   A5 5A, mod, N, len, ftw_start, ftw_step, win_step, code, chip_len, amp, period,
-    //   good SPI packets, bad SPI packets
+    // ---- Capture one pulse and send it back. Header, 43 bytes (host/capture.py):
+    //   A5 5A, {shift, mod}, N, len, ftw_start, ftw_step, win_step, code, chip_len, amp, period,
+    //   good SPI packets, bad SPI packets, packet seq, pulse number, packet profile, packet flags
+    // shift: the capture keeps one sample in 2^shift, the smallest step that fits the whole pulse
     localparam [15:0] CAP_N = 1 << CAP_BITS;
-    wire [295:0] header = {spi_bad_n, spi_ok_n, period, {3'b0, amp}, {8'b0, chip_len}, code,
-                           win_step, ftw_step, ftw_start, {8'b0, len}, CAP_N, {6'b0, mod},
+    function [3:0] fit_shift(input [23:0] length);
+        integer k;
+        begin
+            fit_shift = 4'd0;
+            for (k = 0; k < 10; k = k + 1)
+                if ({1'b0, length} > (25'd1 << (CAP_BITS + k)))
+                    fit_shift = k + 1;
+        end
+    endfunction
+    wire [3:0] cap_shift = fit_shift(len);
+    reg  [15:0] pulse_n = 0;                 // pulses started so far
+    always @(posedge clk50)
+        if (start)
+            pulse_n <= pulse_n + 1;
+    reg stream = 1'b0;
+    always @(posedge clk50)
+        if (rst || stream_off)
+            stream <= 1'b0;
+        else if (stream_on)
+            stream <= 1'b1;
+
+    wire [343:0] header = {cur_tag[31:16], pulse_n, cur_tag[15:0], spi_bad_n, spi_ok_n, period, {3'b0, amp}, {8'b0, chip_len}, code,
+                           win_step, ftw_step, ftw_start, {8'b0, len}, CAP_N, {cap_shift, 2'b0, mod},
                            8'h5A, 8'hA5};
 
     wire [7:0] tx_data;
     wire       tx_valid, tx_ready;
     wire       armed, recording, sending;
-    capture #(.N_BITS(CAP_BITS), .HDR_BYTES(37)) u_cap (
-        .clk(clk50), .rst(rst), .arm(cap_press | capture_req), .trigger(start), .sample(out),
+    capture #(.N_BITS(CAP_BITS), .HDR_BYTES(43)) u_cap (
+        .clk(clk50), .rst(rst), .arm(cap_press | capture_req | stream_on), .stream(stream), .trigger(start), .sample(out), .shift(cap_shift),
         .header(header), .tx_data(tx_data), .tx_valid(tx_valid), .tx_ready(tx_ready),
         .armed(armed), .recording(recording), .sending(sending));
 

@@ -76,9 +76,8 @@ if __name__ == "__main__":
         print("frames:", frames.hex(" "))
         sys.exit(0)
 
-    import serial
-    from capture import read_capture, check
-    with serial.Serial(args.port, 115200, timeout=10) as s:
+    from capture import open_board, read_capture, check
+    with open_board(args.port, timeout=10) as s:
         s.reset_input_buffer()
         s.write(frames)
         print(f"sent to {args.port}")
