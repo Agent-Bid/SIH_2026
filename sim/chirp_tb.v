@@ -1,13 +1,14 @@
 `timescale 1ns/1ps
-// Two windowed LFM chirps: 3 -> 7 MHz, then 7 -> 3 MHz (negative step). Logs every tick.
+// Two windowed LFM chirps: 3 -> 7 MHz, then 7 -> 3 MHz (negative step), 16000 ticks each.
+// ftw_step is FTW per clock x 2^16. Logs every tick.
 // Check with: python3 host/check_chirp.py
 module chirp_tb;
 
-    localparam [15:0] LEN      = 16'd2000;       // ~40 us
-    localparam [31:0] WIN_STEP = 32'd2147484;    // 2^32 / 2000
+    localparam [23:0] LEN      = 24'd16000;      // ~320 us
+    localparam [31:0] WIN_STEP = 32'd268435;     // 2^32 / 16000
     localparam [31:0] F3MHZ    = 32'd256963855;
     localparam [31:0] F7MHZ    = 32'd599582329;
-    localparam [31:0] STEP     = 32'd171309;     // (F7MHZ - F3MHZ) / LEN
+    localparam [31:0] STEP     = 32'd1403365269; // (F7MHZ - F3MHZ) / LEN x 2^16
 
     reg                clk = 0;
     reg                rst = 1;
@@ -46,12 +47,12 @@ module chirp_tb;
 
         repeat (50) tick(0);
         tick(1);                          // up-chirp
-        repeat (2200) tick(0);
+        repeat (16200) tick(0);
 
         ftw_start = F7MHZ;
         ftw_step  = -STEP;                // down-chirp
         tick(1);
-        repeat (2200) tick(0);
+        repeat (16200) tick(0);
 
         $fclose(fd);
         $display("wrote sim/out/chirp_samples.txt -- now run: python3 host/check_chirp.py");

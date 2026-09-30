@@ -3,13 +3,13 @@ module pulse_dds (
     input  wire               clk,
     input  wire               rst,
     input  wire               start,
-    input  wire        [15:0] len,
+    input  wire        [23:0] len,
     input  wire        [31:0] ftw_start,
-    input  wire        [31:0] ftw_step,   // 0 = plain tone
+    input  wire        [31:0] ftw_step,   // LFM: FTW per clock x 2^16 (0 = plain tone); geo: see sweep.v
     input  wire               geo,        // 1 = geometric sweep (see sweep.v)
     input  wire        [31:0] win_step,   // 2^32 / len
     input  wire        [15:0] code,
-    input  wire        [15:0] chip_len,
+    input  wire        [23:0] chip_len,
     input  wire        [12:0] amp,        // 4096 = 1.0
     output wire signed [11:0] out,
     output wire               active

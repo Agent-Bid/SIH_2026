@@ -33,3 +33,13 @@ IO_LOC "dac_d[5]" 30;
 IO_LOC "dac_d[6]" 33;
 IO_LOC "dac_d[7]" 34;
 IO_LOC "dac_clk"  35;
+
+// SPI from the ESP32-S3 (GPIO14 = CS, 12 = MOSI, 13 = SCK), bank 2 = 3.3 V. CS is not used by the
+// design (packets are framed by the pause after each burst, see spi_rx.v). Pin 39 is wired
+// to the ESP32's MISO (GPIO11) but unused. CS is pulled up so it reads "not selected" when
+// the ESP32 is unplugged.
+IO_LOC  "spi_cs_n" 36;
+IO_PORT "spi_cs_n" PULL_MODE=UP;
+IO_LOC  "spi_mosi" 37;
+IO_LOC  "spi_sck"  38;
+IO_PORT "spi_sck"  PULL_MODE=DOWN;

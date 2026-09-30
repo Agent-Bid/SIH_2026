@@ -38,7 +38,7 @@ def golden(inputs, length, win_step, window=None, geo=False):
     window = hann_table() if window is None else window
     active = count = ftw = phase = winph = tone = win = tone_r = win_r = shaped = out = 0
     tick_in_chip = chip = 0
-    geo_n = geo_acc = 0
+    geo_n = geo_acc = acc = 0
     outs, acts = [], []
     for start, ftw_start, ftw_step, amp, code, chip_len in inputs:
         run_rst = not active
@@ -47,26 +47,29 @@ def golden(inputs, length, win_step, window=None, geo=False):
             n_active, n_count = 1, 0
         elif active:
             n_active = 0 if count == length - 1 else 1
-            n_count = (count + 1) % 2**16
+            n_count = (count + 1) % 2**24
         else:
             n_active, n_count = active, count
+        # the sweep register holds FTW x 2^16; the engine uses its top 32 bits
         n_geo_n, n_geo_acc = geo_n, geo_acc
         if run_rst:
-            n_ftw, n_geo_n, n_geo_acc = ftw_start, 0, 0
+            n_acc, n_geo_n, n_geo_acc = ftw_start << 16, 0, 0
         elif not geo:
-            n_ftw = (ftw + ftw_step) % 2**32
+            step = ftw_step - 2**32 if ftw_step >= 2**31 else ftw_step
+            n_acc = (acc + step) % 2**48
         else:                                       # shift-and-add: one bit of step per tick
-            total = geo_acc + (ftw if (ftw_step >> geo_n) & 1 else 0)
+            total = geo_acc + (acc if (ftw_step >> geo_n) & 1 else 0)
             n_geo_n = (geo_n + 1) % 32
             if geo_n == 31:
-                n_ftw, n_geo_acc = (ftw + (total >> 1)) % 2**32, 0
+                n_acc, n_geo_acc = (acc + (total >> 1)) % 2**48, 0
             else:
-                n_ftw, n_geo_acc = ftw, total >> 1
+                n_acc, n_geo_acc = acc, total >> 1
+        ftw = acc >> 16
         n_phase = 0 if run_rst else (phase + ftw) % 2**32
         n_winph = 0 if run_rst else (winph + win_step) % 2**32
         if run_rst:
             n_tick, n_chip = 0, 0
-        elif tick_in_chip == chip_len - 1:
+        elif tick_in_chip == (chip_len - 1) % 2**24:
             n_tick, n_chip = 0, (chip + 1) % 16
         else:
             n_tick, n_chip = tick_in_chip + 1, chip
@@ -75,7 +78,7 @@ def golden(inputs, length, win_step, window=None, geo=False):
         n_tone_r, n_win_r = tone, win               # pipeline register before the multiply
         n_shaped = (tone_r * win_r) >> 12
         n_out = (shaped * amp) >> 12
-        active, count, ftw, phase, winph = n_active, n_count, n_ftw, n_phase, n_winph
+        active, count, acc, phase, winph = n_active, n_count, n_acc, n_phase, n_winph
         tick_in_chip, chip = n_tick, n_chip
         geo_n, geo_acc = n_geo_n, n_geo_acc
         tone, win, tone_r, win_r, shaped, out = n_tone, n_win, n_tone_r, n_win_r, n_shaped, n_out
@@ -86,12 +89,18 @@ def golden(inputs, length, win_step, window=None, geo=False):
 
 def geo_ftw(ftw_start, ftw_step, length):
     """The ftw a geometric sweep has reached after each clock of a pulse (for plots)."""
-    track, ftw = [], ftw_start
+    track, acc = [], ftw_start << 16
     for k in range(length):
-        track.append(ftw)
+        track.append(acc >> 16)
         if k % 32 == 31:
-            ftw = (ftw + ftw * ftw_step // 2**32) % 2**32
+            acc = (acc + acc * ftw_step // 2**32) % 2**48
     return np.array(track)
+
+
+def lfm_ftw(ftw_start, ftw_step, length):
+    """The ftw an LFM sweep has reached after each clock (ftw_step = FTW per clock x 2^16)."""
+    step = ftw_step - 2**32 if ftw_step >= 2**31 else ftw_step
+    return ((ftw_start << 16) + step * np.arange(length, dtype=object)) % 2**48 >> 16
 
 
 def pulses(act):

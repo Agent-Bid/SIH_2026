@@ -24,7 +24,7 @@ ok_sweep = True
 for p0, n in found:
     ftw_start, ftw_step = inputs[p0][1], inputs[p0][2]
     ftw_step = ftw_step - 2**32 if ftw_step >= 2**31 else ftw_step
-    f_start, f_end = hz(ftw_start), hz(ftw_start + ftw_step * n)
+    f_start, f_end = hz(ftw_start), hz(ftw_start + ftw_step * n / 2**16)   # step is FTW/clock x 2^16
     seg = sim_out[p0:p0 + n].astype(float)
     k = np.arange(int(0.1 * n), int(0.9 * n))
     inst_f = np.diff(np.unwrap(np.angle(hilbert(seg)))) * F_CLK / (2 * np.pi)

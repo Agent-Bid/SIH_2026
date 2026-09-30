@@ -1,33 +1,41 @@
 `timescale 1ns/1ps
-// Board-level test of top.v: a stand-in PLL, a fast UART and a short capture.
-// The "PC" sends the frames made by host/wavegen.py (sim/top_frames.hex):
-//   1. SET an LFM chirp 150 -> 500 kHz, then CAPTURE
-//   2. SET a geometric sweep 150 -> 500 kHz, then CAPTURE
-//   3. SET BPSK Barker-13 at 250 kHz, then CAPTURE
+// Board-level test of top.v: a stand-in PLL, a fast UART, a short capture, and a pretend ESP32.
+//   1. PC over UART: SET an LFM chirp 150 -> 500 kHz, then CAPTURE
+//   2. ESP32 over SPI: a packet with a broken CRC (must be rejected), then a geometric sweep
+//      150 -> 500 kHz with CS left high the whole time (the FPGA frames packets by the pause
+//      after each burst, see spi_rx.v); then the PC asks for a CAPTURE
+//   3. PC over UART: SET BPSK Barker-13 at 250 kHz, then CAPTURE
+// The frames and the packet come from host/wavegen.py (sim/top_frames.hex, sim/top_spi.hex).
 // Everything the board sends back is written to a file.
 // Check with: python3 host/capture.py --file sim/out/top_uart.txt
 module top_tb;
 
     localparam BAUD_DIV = 8;
     localparam CAP_BITS = 11;                          // 2048 samples per capture
-    localparam BYTES    = 29 + 2 * (1 << CAP_BITS);    // one capture
-    localparam GROUP    = 32;                          // SET frame (29) + CAPTURE frame (3)
+    localparam BYTES    = 37 + 2 * (1 << CAP_BITS);    // one capture
+    localparam GROUP    = 63;                          // SET frame (60) + CAPTURE frame (3)
+    localparam PKT      = 57;                          // one ESP32 packet
+    localparam SCK_HALF = 250;                         // ns: SPI at 2 MHz, like the ESP32
 
-    reg        clk  = 0;
+    reg        clk   = 0;
     reg        pc_tx = 1;
+    reg        sck   = 0;
+    reg        mosi  = 0;
+    reg        cs_n  = 1;
     wire [5:0] led;
     wire       uart_tx;
     wire [7:0] dac_d;
     wire       dac_clk;
 
     top #(.CAP_BITS(CAP_BITS), .BAUD_DIV(BAUD_DIV), .BTN_BITS(3)) dut (
-        .clk(clk), .btn1(1'b1), .btn2(1'b1), .uart_rx(pc_tx), .led(led),
+        .clk(clk), .btn1(1'b1), .btn2(1'b1), .uart_rx(pc_tx),
+        .spi_sck(sck), .spi_mosi(mosi), .spi_cs_n(cs_n), .led(led),
         .uart_tx(uart_tx), .dac_d(dac_d), .dac_clk(dac_clk));
 
     always #10 clk = ~clk;
 
-    // ---- PC -> board
-    reg [7:0] frames [0:3*GROUP-1];
+    // ---- PC -> board (UART)
+    reg [7:0] frames [0:2*GROUP-1];
     initial $readmemh("sim/top_frames.hex", frames);
 
     task send_byte(input [7:0] b);
@@ -45,6 +53,27 @@ module top_tb;
         integer k;
         for (k = 0; k < GROUP; k = k + 1)
             send_byte(frames[g * GROUP + k]);
+    endtask
+
+    // ---- ESP32 -> board (SPI mode 0, MSB first, CS low for the whole packet)
+    reg [7:0] pkt [0:PKT-1];
+    initial $readmemh("sim/top_spi.hex", pkt);
+
+    task spi_packet(input corrupt, input use_cs);
+        integer k, j;
+        reg [7:0] b;
+        begin
+            cs_n = !use_cs; #(SCK_HALF);
+            for (k = 0; k < PKT; k = k + 1) begin
+                b = (corrupt && k == 30) ? pkt[k] ^ 8'h01 : pkt[k];
+                for (j = 7; j >= 0; j = j - 1) begin
+                    mosi = b[j]; #(SCK_HALF);
+                    sck  = 1;    #(SCK_HALF);
+                    sck  = 0;
+                end
+            end
+            #(SCK_HALF); cs_n = 1; #(200_000);            // 200 us pause: ends the frame
+        end
     endtask
 
     // ---- board -> PC
@@ -76,12 +105,20 @@ module top_tb;
         send_group(0);
         wait (nbytes == BYTES);
 
-        $display("PC: set geometric sweep + capture");
-        send_group(1);
+        $display("ESP32: a packet with a broken CRC, then a geometric sweep; PC: capture");
+        spi_packet(1, 1);
+        spi_packet(0, 0);
+        repeat (200) @(posedge clk);
+        if (dut.spi_ok_n !== 16'd1 || dut.spi_bad_n !== 16'd1)
+            $display("FAIL: SPI packets counted good %0d bad %0d, expected 1 and 1",
+                     dut.spi_ok_n, dut.spi_bad_n);
+        else
+            $display("  SPI: the broken packet was rejected, the good one accepted");
+        send_byte(8'hA5); send_byte(8'h02); send_byte(8'h02);
         wait (nbytes == 2 * BYTES);
 
         $display("PC: set BPSK Barker-13 + capture");
-        send_group(2);
+        send_group(1);
         wait (nbytes == 3 * BYTES);
 
         repeat (100) @(posedge clk);

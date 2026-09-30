@@ -3,24 +3,24 @@ module phase_code (
     input wire            clk,
     input wire            rst,
     input wire [15:0]     code,
-    input wire [15:0]     chip_len,
+    input wire [23:0]     chip_len,
     output wire           flip
 );
 
-    reg [15:0] tick;
+    reg [23:0] tick;
     reg [3:0] chip;
 
     always @(posedge clk)
       if (rst) begin
-          tick <= 16'd0;
+          tick <= 24'd0;
           chip <= 4'b0;
       end
       else if (tick == chip_len - 1) begin
-          tick <= 16'd0;
+          tick <= 24'd0;
           chip <= chip + 4'b1;
       end
       else
-          tick <= tick + 16'd1;
+          tick <= tick + 24'd1;
 
     assign flip = code[chip];
 

@@ -1,5 +1,6 @@
-"""Send waveform settings to the board over the USB UART (the PC plays the MCU),
-and optionally capture one pulse and check it against the golden model.
+"""Send waveform settings to the board over the USB UART (the PC plays the ESP32), and
+optionally capture one pulse and check it against the golden model. The settings go as a
+real ESP32 packet (host/mcu_packet.py), inside the UART frame A5 01 <57 bytes> <xor>.
 
   python3 host/wavegen.py chirp --fc 325e3 --bw 350e3 --capture     # LFM, 150 -> 500 kHz
   python3 host/wavegen.py geo   --fc 325e3 --bw 350e3 --capture     # geometric, 150 -> 500 kHz
@@ -10,43 +11,17 @@ Every pulse is LEN = 13000 clocks (259 us); sweeps go up, from fc - bw/2 to fc +
 BPSK always uses Barker-13, 1000 clocks per chip.
 Common options: --amp 0..1 (default 1.0), --period clocks between pulse starts,
 --port (default /dev/ttyUSB1), --dry-run (print the frame, don't send).
+If the ESP32 is connected it sends its own packet 10 times a second, which replaces these
+settings within 100 ms: to capture what the ESP32 asked for, use  host/capture.py --request.
 """
 import argparse
-import struct
 import sys
-from model import F_CLK, K, geo_ftw
+import mcu_packet as mp
+from model import geo_ftw, lfm_ftw
 
 LEN = 13000
-BARKER13 = "+++++--++-+-+"                  # + = normal, - = flipped; chip i = bit i
-CODE = sum(1 << i for i, c in enumerate(BARKER13) if c == "-")
-CHIP_LEN = LEN // len(BARKER13)
-MODE_GEO = 1
-STRUCT = "<HIIIHHHIH"                       # len ftw_start ftw_step win_step code chip_len amp period mode
-F_MAX = 0.4 * F_CLK                         # keep well under Nyquist (F_CLK / 2)
-
-
-def settings(args):
-    """Real-world units -> the 26-byte settings struct (same fields as top.v)."""
-    code, chip_len, step, mode = 0, CHIP_LEN, 0, 0
-    f0 = args.fc - args.bw / 2 if args.kind in ("chirp", "geo") else args.fc
-    start = round(f0 * K)
-    if args.kind == "chirp":
-        step = round(args.bw * K / LEN)
-    elif args.kind == "geo":
-        mode = MODE_GEO
-        step = round(((args.fc + args.bw / 2) / f0) ** (1 / (LEN // 32)) * 2**32 - 2**32)   # LEN // 32 updates
-    elif args.kind == "bpsk":
-        code = CODE
-    end = geo_ftw(start, step, LEN)[-1] if mode else start + step * LEN
-    if start <= 0 or end / K > F_MAX or not 0 <= step < 2**32:
-        sys.exit(f"frequencies must stay between 0 and {F_MAX/1e6:.1f} MHz")
-    period = args.period or LEN + 12000
-    if period <= LEN:
-        sys.exit(f"--period ({period}) must be longer than the pulse ({LEN})")
-    amp = max(0, min(4096, round(args.amp * 4096)))
-    win_step = round(2**32 / LEN)
-    fields = (LEN, start, step, win_step, code, chip_len, amp, period, mode)
-    return fields, struct.pack(STRUCT, *fields)
+KINDS = {"tone": mp.CW, "chirp": mp.LFM, "geo": mp.GEO, "bpsk": mp.BPSK}
+F_MAX = 0.4 * mp.F_CLK                      # keep well under Nyquist (F_CLK / 2)
 
 
 def frame(cmd, payload=b""):
@@ -56,41 +31,48 @@ def frame(cmd, payload=b""):
     return bytes([0xA5, cmd]) + payload + bytes([chk])
 
 
-def describe(fields):
-    length, start, step, win_step, code, chip_len, amp, period, mode = fields
-    end = geo_ftw(start, step, length)[-1] if mode & MODE_GEO else start + step * length
-    kind = ("geometric sweep" if mode & MODE_GEO else "LFM chirp" if step else
-            "BPSK" if code else "tone")
-    print(f"{kind}: {start/K/1e3:.2f} -> {end/K/1e3:.2f} kHz, pulse {length} clocks "
-          f"({length / F_CLK * 1e6:.1f} us), every {period} clocks; amp {amp / 4096:.3f}")
-    if code:
-        print(f"phase code Barker-13 ({code:#06x}), {chip_len} clocks per chip")
-    print(f"ftw_start {start}  ftw_step {step}  win_step {win_step}  mode {mode}")
+def describe(p):
+    mod, length, start, step = p["modulation"], p["len_clk"], p["ftw_start"], p["ftw_step"]
+    end = (geo_ftw(start, step, length) if mod == mp.GEO else lfm_ftw(start, step, length))[-1]
+    print(f"{mp.MOD_NAMES[mod]}: {start/mp.K/1e3:.2f} -> {end/mp.K/1e3:.2f} kHz, pulse {length} clocks "
+          f"({length / mp.F_CLK * 1e6:.1f} us), every {p['period_clk']} clocks; amp {p['amp_q12'] / 4096:.3f}")
+    if p["code"]:
+        print(f"phase code Barker-13 ({p['code']:#06x}), {p['chip_len']} clocks per chip")
+    print(f"ftw_start {start}  ftw_step {step}  win_step {p['win_step']}")
 
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("kind", choices=["tone", "chirp", "geo", "bpsk"])
+    ap.add_argument("kind", choices=list(KINDS))
     ap.add_argument("--fc", type=float, required=True, help="centre / carrier frequency, Hz")
     ap.add_argument("--bw", type=float, default=0, help="sweep bandwidth, Hz (chirp, geo)")
     ap.add_argument("--amp", type=float, default=1.0)
-    ap.add_argument("--period", type=int, default=0, help="clocks between pulse starts")
+    ap.add_argument("--period", type=int, default=LEN + 12000, help="clocks between pulse starts")
     ap.add_argument("--capture", action="store_true", help="capture the next pulse and check it")
     ap.add_argument("--port", default="/dev/ttyUSB1")
     ap.add_argument("--dry-run", action="store_true", help="print the frames instead of sending")
-    ap.add_argument("--frames-out", help="append the frames as hex lines to this file (for top_tb)")
+    ap.add_argument("--frames-out", help="append the UART frames as hex lines to this file (for top_tb)")
+    ap.add_argument("--spi-out", help="append the bare packet as hex lines to this file (top_tb's ESP32)")
     args = ap.parse_args()
-    if args.kind in ("chirp", "geo") and args.bw <= 0:
+    mod = KINDS[args.kind]
+    if mod in (mp.LFM, mp.GEO) and args.bw <= 0:
         sys.exit(f"a {args.kind} sweep needs --bw")
+    if args.period <= LEN:
+        sys.exit(f"--period ({args.period}) must be longer than the pulse ({LEN})")
+    if (args.fc + args.bw / 2) > F_MAX or args.fc - args.bw / 2 <= 0:
+        sys.exit(f"frequencies must stay between 0 and {F_MAX/1e6:.1f} MHz")
 
-    fields, payload = settings(args)
-    describe(fields)
-    frames = frame(0x01, payload) + (frame(0x02) if args.capture else b"")
+    packet = mp.build(mod, args.fc, args.bw, LEN / mp.F_CLK, args.amp, args.period / mp.F_CLK)
+    describe(mp.parse(packet))
+    frames = frame(0x01, packet) + (frame(0x02) if args.capture else b"")
 
+    if args.spi_out:
+        with open(args.spi_out, "a") as f:
+            f.writelines(f"{b:02x}\n" for b in packet)
     if args.frames_out:
         with open(args.frames_out, "a") as f:
             f.writelines(f"{b:02x}\n" for b in frames)
-    if args.dry_run or args.frames_out:
+    if args.dry_run or args.frames_out or args.spi_out:
         print("frames:", frames.hex(" "))
         sys.exit(0)
 

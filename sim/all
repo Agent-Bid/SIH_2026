@@ -17,6 +17,8 @@ for tb in phase_acc_tb pulse_ctrl_tb phase_code_tb dds_tb pulse_dds_tb chirp_tb 
     [[ -f sim/$tb.v ]] || continue
     if ! out=$(sim/run "$tb" 2>&1); then
         result="FAIL (did not compile: $(grep -m1 -iE 'error' <<<"$out"))"
+    elif grep -q '^FAIL' <<<"$out"; then
+        result=$(grep -m1 '^FAIL' <<<"$out")
     elif [[ -n "${checker[$tb]}" ]]; then
         result=$(python3 ${checker[$tb]} 2>&1 | tail -1)
     else
