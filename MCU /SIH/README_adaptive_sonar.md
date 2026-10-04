@@ -151,7 +151,7 @@ Four tasks, connected by "latest value" queues (length 1, overwrite; plus a shor
   `PING seq=… contact=… T=… S=… D=… turb=… bat=… R=… v=… profile=… mod=… amp=… ml_profile=… ml_mod=… ml_amp=… flags=… doppler=…`
 - `W`: type the seven inputs one by one (Enter keeps a value, `q` cancels), then a full report: what each network picked and what the physics did with it, the result, and the values sent to the FPGA. `I T S D turb bat R v`: the same on one line, ending with a `DECISION` line for programs.
 - `R 450`: target range. `M lfm | geo | bpsk | cw | auto`: force a modulation (`auto` = from the motion). `P`: potentiometers. `L`: status line. `?`: help.
-- `C [amp]`: DAC view. Sends the FPGA a slow-motion copy of the current ping (frequencies ÷ up to 100, so the ADC can follow), records the DAC filter's output on GPIO 1 with the ADC (up to 80 kS/s), and prints it (`CAP` header, `D` lines of hex millivolts, `END`) for `host/dac_view.py` in the FPGA project.
+- `C [amp]`: DAC view. Sends the FPGA a slow-motion copy of the current ping (frequencies ÷ up to 100, so the ADC can follow), records the DAC filter's output on GPIO 1 with the ADC (up to 80 kS/s), and prints it (`CAP` header, `D` lines of hex millivolts, `END`) for `host/dac_view.py` in the FPGA project. `S [n] [r]`: the same for the next n decisions (default 6), each recorded r times (default 4), with a `COND` line of conditions before each; for `host/dac_sequence.py`.
 - The console writes in small pieces and waits for each to leave: the USB-Serial/JTAG driver loses text that is queued faster than the host reads it, and `Serial.flush()` can discard it.
 
 ---

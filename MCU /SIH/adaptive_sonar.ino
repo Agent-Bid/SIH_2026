@@ -24,6 +24,8 @@
       C [amp]    -> DAC view: records the DAC filter output on GPIO 1 during a slow-motion copy
                     of the current ping, optionally at another amplitude 0..1 (host/dac_view.py
                     in the FPGA project plots it)
+      S [n] [r]  -> the same for the next n decisions (default 6 = one second), each recorded
+                    r times (default 4) (host/dac_sequence.py averages and plots them)
       Enter or W -> type new inputs: it asks for each value, then prints the decision
       I 15 35 50 20 100 300 0.5 -> all seven inputs on one line (temperature, salinity, depth,
                     turbidity, battery, range, speed); the report ends with a DECISION line
@@ -331,6 +333,7 @@ static void printPrompt() {
 static void printHelp() {
   out("\n  A            automatic: simulated water conditions, one PING line per ping\n");
   out("  C [amp]      DAC view: record GPIO 1 during a slow-motion copy of the current ping\n");
+  out("  S [n] [r]    DAC view of the next n pings (default 6), each recorded r times (default 4)\n");
   out("  Enter or W   type new inputs (Enter keeps a value, q cancels)\n");
   out("  R <metres>   target range, e.g. R 450\n");
   out("  M <mod>      modulation: auto (from the motion) | lfm | geo | bpsk | cw\n");
@@ -428,12 +431,11 @@ static bool slowPacket(const Telemetry &t, float amp, sonar::SonarPacket &k, int
   return true;
 }
 
-static void captureDac(float amp) {
+// index >= 0: part of a sequence (S command); a COND line with the ping's conditions comes first
+static void captureDac(const Telemetry &t, float amp, int index) {
 #if HAVE_ADC_CAPTURE
-  Telemetry t;
   sonar::SonarPacket k;
   int n;
-  if (xQueuePeek(qTelem, &t, 0) != pdTRUE) { out("CAPERR no decision yet\n"); return; }
   if (!slowPacket(t, amp, k, n)) { out("CAPERR this waveform does not fit in slow motion\n"); return; }
   const double window = 2.7 * k.lenClk / FPGA_CLK_HZ;        // a whole pulse fits, whatever its phase
   const uint32_t rate = (uint32_t)fmin((double)DAC_VIEW_MAX_RATE, DAC_VIEW_MAX_SAMPLES / window);
@@ -491,6 +493,16 @@ static void captureDac(float amp) {
   gCapture = false;
   if (!ok) { free(mv); out("CAPERR ADC failed (was potentiometer mode used since power-on? reset the ESP32)\n"); return; }
 
+  if (index >= 0) {
+    const int pm = t.pkt.modulation, mm = t.ml.mod;
+    out("COND idx=%d pseq=%u contact=%c T=%.2f S=%.2f D=%.1f turb=%.1f bat=%.1f R=%lu v=%.2f profile=%s"
+        " mod=%s amp=%.3f ml_profile=%s ml_mod=%s flags=0x%02X doppler=%.2f\n", index, t.pkt.seq,
+        t.contact >= 0 ? "ABC"[t.contact] : '-', t.env.tempC, t.env.salinityPpt, t.env.depthM,
+        t.env.turbidityNtu, t.env.batteryPct, (unsigned long)t.rangeM, t.env.speedMs,
+        PROFILES[t.dec.profile].name, pm < 4 ? MOD_NAMES[pm] : "-", t.dec.ampFrac,
+        t.ml.profile >= 0 ? PROFILES[t.ml.profile].name : "-", (mm >= 0 && mm < 4) ? MOD_NAMES[mm] : "-",
+        t.dec.flags, t.dec.dopplerCycles);
+  }
   out("CAP n=%lu rate=%lu meas=%.1f slow=%d mod=%u len=%lu ftw_start=%lu ftw_step=%ld win_step=%lu amp=%u"
       " code=%u chip=%lu period=%lu profile=%s\n", (unsigned long)got, (unsigned long)rate, got / secs, n,
       k.modulation, (unsigned long)k.lenClk, (unsigned long)k.ftwStart, (long)k.ftwStep,
@@ -505,9 +517,32 @@ static void captureDac(float amp) {
   out("END\n");
   free(mv);
 #else
+  (void)t;
   (void)amp;
+  (void)index;
   out("CAPERR not supported on this build\n");
 #endif
+}
+
+static void captureLatest(float amp) {
+  Telemetry t;
+  if (xQueuePeek(qTelem, &t, 0) != pdTRUE) { out("CAPERR no decision yet\n"); return; }
+  captureDac(t, amp, -1);
+}
+
+// The next `count` decisions as they are made (6 = one second of pings), then each recorded
+// `reps` times in slow motion
+static void captureSequence(int count, int reps) {
+  static Telemetry seq[12];
+  count = count < 1 ? 6 : (count > 12 ? 12 : count);
+  reps = reps < 1 ? 4 : (reps > 16 ? 16 : reps);
+  Telemetry t;
+  while (xQueueReceive(qPing, &t, 0) == pdTRUE) {}            // only decisions made from now on
+  for (int i = 0; i < count; i++)
+    if (xQueueReceive(qPing, &seq[i], pdMS_TO_TICKS(2000)) != pdTRUE) { out("CAPERR no decisions coming\n"); return; }
+  for (int i = 0; i < count; i++)
+    for (int r = 0; r < reps; r++) captureDac(seq[i], 0.0f, i);
+  out("SEQEND\n");
 }
 
 static void handleCommand(char *w) {
@@ -515,7 +550,13 @@ static void handleCommand(char *w) {
   if (c == 0 && gSim) return;                              // Enter alone does not stop the simulation
   if (c == 0 || c == 'W' || c == 'w') { startAsking(); return; }
   if (c == 'C' || c == 'c') {
-    captureDac(strtof(w + 1, nullptr));                     // no number: 0 = keep the ping's own amplitude
+    captureLatest(strtof(w + 1, nullptr));                  // no number: 0 = keep the ping's own amplitude
+    return;
+  }
+  if (c == 'S' || c == 's') {
+    char *end;
+    const long count = strtol(w + 1, &end, 10);
+    captureSequence((int)count, (int)strtol(end, nullptr, 10));
     return;
   }
   if (c == 'A' || c == 'a') {

@@ -54,7 +54,8 @@ python3 host/capture.py --request                                # capture what 
 - **The DAC output without a scope**: wire pin 40 → 1 kΩ + 100 pF → 10 kΩ + 10 pF → ESP32
   GPIO 1, then `python3 host/dac_view.py --amp 1`. The ESP32 records the filtered voltage while
   the FPGA plays a slow-motion copy of the current ping, and the plot lays it over the FPGA's own
-  samples (`sim/out/dac_view.png`).
+  samples (`sim/out/dac_view.png`). `python3 host/dac_sequence.py` does it for one second of
+  pings (6 decisions, each recorded 4× and averaged) on one graph (`sim/out/dac_sequence.png`).
 - On the board: **S1** steps through three presets (chirp, geometric, BPSK), **S2** captures
   the next pulse (listen with `python3 host/capture.py`).
 - **Oscilloscope** (no DAC needed): pin 40 → 1 kΩ → probe point, 100 pF from the probe point

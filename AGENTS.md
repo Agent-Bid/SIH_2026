@@ -92,6 +92,7 @@ Run everything from this folder (the project root): scripts and `$readmemh` use 
 | `host/water_sim.py` | Python twin of the ESP32's simulated conditions: the conditions behind a packet, from its sequence number |
 | `host/esp_console.py` | Terminal for the ESP32's serial console that does not reset it |
 | `host/dac_view.py` | Before vs after the DAC without a scope: ESP32 ADC recording of the filtered sigma-delta output (slow motion) against the golden model |
+| `host/dac_sequence.py` | The same for one second of pings: the ESP32's next 6 decisions, each recorded 4× and averaged, on one broken-time-axis graph with close-ups and a conditions table (`--replot` redraws the saved recording) |
 | `host/check_*.py` | Checkers for the unit testbenches; `check_water_sim.py` compares `water_sim.py` with the C++ |
 | `sim/run`, `sim/all` | Run one testbench / all testbenches with their checkers |
 | `sim/*_tb.v` | Testbenches (see section 9) |
@@ -361,6 +362,9 @@ H 270–330 kHz, M 180–220 kHz, L 100–140 kHz, each with 1 / 5 / 20 ms pulse
   inside), then prints `CAP key=value …` (the packet's FPGA fields), `D` lines of 3-digit hex mV,
   and `END`. The ADC continuous driver cannot start if the potentiometer mode (one-shot ADC)
   was used since power-on: reset the ESP32 first. `host/dac_view.py [--amp 1]` runs it and plots.
+- `S [n] [r]`: the next n decisions (default 6) as they are made, each captured r times (default
+  4) as above, each block preceded by a `COND` line with the ping's conditions; ends with
+  `SEQEND`. `host/dac_sequence.py` runs it (about 2.5 minutes) and plots.
 - The console writes in 32-byte pieces and waits for each to leave: the USB-Serial/JTAG
   driver loses text when it is queued faster, and `Serial.flush()` can discard it.
 
@@ -425,6 +429,7 @@ tn9k load                                # build + load the FPGA (SRAM)
 python3 host/demo.py                     # one second of the running system (ESP32 + FPGA), 6 pings
 python3 host/check_water_sim.py          # the PC's copy of the simulated conditions matches the C++
 python3 host/dac_view.py --amp 1         # the sigma-delta DAC's filtered output vs the FPGA's samples (no scope)
+python3 host/dac_sequence.py             # one second of pings through the DAC, measured (~2.5 min)
 python3 host/wavegen.py geo --fc 325e3 --bw 350e3 --capture   # PC sets a waveform, captures, checks
 python3 host/capture.py --request        # capture whatever is playing now (e.g. the ESP32's choice)
 python3 host/capture.py                  # wait for S2 presses
