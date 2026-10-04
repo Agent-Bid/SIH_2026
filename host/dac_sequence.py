@@ -112,7 +112,7 @@ def plot(pings, results, reps, path, show):
     n = len(pings)
     c_before, c_after = "#2a78d6", "#eb6834"
     fig = plt.figure(figsize=(18, 11))
-    gs = fig.add_gridspec(2, n, left=0.05, right=0.99, top=0.9, bottom=0.33, wspace=0.22, hspace=0.45,
+    gs = fig.add_gridspec(2, n, left=0.05, right=0.99, top=0.88, bottom=0.33, wspace=0.22, hspace=0.45,
                           height_ratios=[2.1, 1])
     dev = max(np.abs(np.concatenate([r[1], r[2]]) - VDD / 2).max() for r in results)
     axes = []
@@ -122,10 +122,9 @@ def plot(pings, results, reps, path, show):
         ax.plot(t_ms, expect, lw=0.8, color=c_before, label="before the DAC: FPGA samples")
         ax.plot(t_ms, after, lw=0.6, color=c_after, alpha=0.85, label="after the DAC: measured")
         c = p["cond"]
-        ax.set_title(f"ping {i + 1} · {i * PING_PERIOD_MS:.0f} ms", fontsize=11, fontweight="bold")
-        ax.text(0.03, 0.97, f"{c['contact']}: {c['R']} m, {float(c['v']):.1f} m/s\n"
-                            f"{c['profile']} {MOD_NAME.get(c['mod'], c['mod'])}, amp {float(c['amp']):.2f}",
-                transform=ax.transAxes, va="top", fontsize=8.5)
+        ax.set_title(f"{i * PING_PERIOD_MS:.0f} ms", fontsize=11, fontweight="bold")
+        ax.text(0.03, 0.97, f"{c['profile']} {MOD_NAME.get(c['mod'], c['mod'])} · {float(c['amp']):.2f}",
+                transform=ax.transAxes, va="top", fontsize=9)
         ax.set_xlim(0, t_ms[-1])
         ax.set_xlabel("ms")
         if i:
@@ -140,7 +139,7 @@ def plot(pings, results, reps, path, show):
         axz = fig.add_subplot(gs[1, i])
         axz.plot(t_ms[k] * 1e3, expect[k], lw=1.2, color=c_before)
         axz.plot(t_ms[k] * 1e3, after[k], ".-", lw=0.7, ms=2.5, color=c_after)
-        axz.set_title("close-up" + (" at a phase flip" if int(info["code"]) else ""), fontsize=9)
+        axz.set_title("close-up", fontsize=9)
         axz.set_xlabel("µs", fontsize=8)
         axz.tick_params(labelsize=7)
         axz.xaxis.set_major_locator(plt.MaxNLocator(4))
@@ -150,9 +149,12 @@ def plot(pings, results, reps, path, show):
                         lw=1.2, clip_on=False)
     axes[0].set_ylim(VDD / 2 - 1.25 * dev, VDD / 2 + 1.6 * dev)
     axes[0].set_ylabel("volts")
-    axes[0].legend(loc="lower left", fontsize=8)
-    fig.suptitle(f"One second of pings through the 1-bit DAC + RC filter (measured, {reps}× averaged, recorded in "
-                 f"slow motion)   // = ~166 ms of baseline skipped", fontsize=12)
+    fig.suptitle("One second of pings through the DAC", fontsize=14, fontweight="bold", y=0.985)
+    from matplotlib.lines import Line2D
+    fig.legend([Line2D([], [], color=c_before, lw=3), Line2D([], [], color=c_after, lw=3)],
+               ["Blue: FPGA output (before the DAC)", "Orange: measured DAC output (after the filter)"],
+               loc="upper center", bbox_to_anchor=(0.5, 0.955), ncol=2, fontsize=11, frameon=False)
+    fig.text(0.99, 0.93, "// = baseline skipped", ha="right", fontsize=9, color="#52514e")
 
     cols = ["ping", "t (ms)", "contact", "range m", "speed m/s", "temp C", "depth m", "turb NTU", "battery %",
             "waveform", "frequency", "length", "amplitude", "network", "match (corr.)"]
