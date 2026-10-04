@@ -194,7 +194,7 @@ def plot_tall(pings, results, reps, path, show):
     n = len(pings)
     c_before, c_after = "#2a78d6", "#eb6834"
     fig = plt.figure(figsize=(9, 14.5))
-    gs = fig.add_gridspec(n, 2, left=0.09, right=0.98, top=0.915, bottom=0.2, wspace=0.12, hspace=0.75,
+    gs = fig.add_gridspec(n, 2, left=0.09, right=0.95, top=0.915, bottom=0.2, wspace=0.17, hspace=0.75,
                           width_ratios=[2.3, 1])
     dev = max(np.abs(np.concatenate([r[1], r[2]]) - VDD / 2).max() for r in results)
     axes = []
@@ -244,7 +244,8 @@ def plot_tall(pings, results, reps, path, show):
     tab.auto_set_column_width(list(range(len(cols))))
     tab.scale(1.17, 1.6)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=130)
+    fig.savefig(path, dpi=300)
+    fig.savefig(os.path.splitext(path)[0] + ".svg")       # sharp at any size
     if show:
         import signal
         signal.signal(signal.SIGINT, signal.SIG_DFL)      # Tk would otherwise swallow Ctrl+C
