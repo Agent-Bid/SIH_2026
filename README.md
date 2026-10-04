@@ -56,6 +56,11 @@ python3 host/capture.py --request                                # capture what 
   the FPGA plays a slow-motion copy of the current ping, and the plot lays it over the FPGA's own
   samples (`sim/out/dac_view.png`). `python3 host/dac_sequence.py` does it for one second of
   pings (6 decisions, each recorded 4× and averaged) on one graph (`sim/out/dac_sequence.png`).
+- **The DAC output at full speed**: the filter is now RC (1 kΩ + 100 pF) → OPA340 Sallen-Key
+  (10 kΩ, 1 kΩ, 100 pF feedback, 20 pF) on the LASC board's channel 2 (output J6 pin 7). A
+  BlackPill (`blackpill/`, flash with `pio run -t upload` in DFU mode) records it at 2.4 MS/s on
+  PA1, triggered by pin 41 on PB0. `python3 host/real_speed.py` records 6 consecutive pings, pairs
+  each with the FPGA's header for that pulse and plots them unslowed (`sim/out/real_speed.png`).
 - On the board: **S1** steps through three presets (chirp, geometric, BPSK), **S2** captures
   the next pulse (listen with `python3 host/capture.py`).
 - **Oscilloscope** (no DAC needed): pin 40 → 1 kΩ → probe point, 100 pF from the probe point

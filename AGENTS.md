@@ -93,6 +93,7 @@ Run everything from this folder (the project root): scripts and `$readmemh` use 
 | `host/esp_console.py` | Terminal for the ESP32's serial console that does not reset it |
 | `host/dac_view.py` | Before vs after the DAC without a scope: ESP32 ADC recording of the filtered sigma-delta output (slow motion) against the golden model |
 | `host/dac_sequence.py` | The same for one second of pings: the ESP32's next 6 decisions, each recorded 4× and averaged, on one broken-time-axis graph with close-ups and a conditions table (`--replot` redraws the saved recording) |
+| `host/real_speed.py` | Pings at full speed after the DAC: the BlackPill (`blackpill/src/main.cpp`, ADC at 2.4 MS/s on PA1, trigger pin 41 on PB0) records 6 consecutive pulses while the FPGA streams their headers; each recording is paired with its pulse by correlation and plotted over the golden model, with no slow motion or averaging |
 | `host/check_*.py` | Checkers for the unit testbenches; `check_water_sim.py` compares `water_sim.py` with the C++ |
 | `sim/run`, `sim/all` | Run one testbench / all testbenches with their checkers |
 | `sim/*_tb.v` | Testbenches (see section 9) |
@@ -430,6 +431,7 @@ python3 host/demo.py                     # one second of the running system (ESP
 python3 host/check_water_sim.py          # the PC's copy of the simulated conditions matches the C++
 python3 host/dac_view.py --amp 1         # the sigma-delta DAC's filtered output vs the FPGA's samples (no scope)
 python3 host/dac_sequence.py             # one second of pings through the DAC, measured (~2.5 min)
+python3 host/real_speed.py               # 6 pings at full speed after the DAC (BlackPill ADC, 2.4 MS/s)
 python3 host/wavegen.py geo --fc 325e3 --bw 350e3 --capture   # PC sets a waveform, captures, checks
 python3 host/capture.py --request        # capture whatever is playing now (e.g. the ESP32's choice)
 python3 host/capture.py                  # wait for S2 presses
