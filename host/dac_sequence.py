@@ -176,7 +176,8 @@ def plot(pings, results, reps, path, show):
     tab.auto_set_column_width(list(range(len(cols))))
     tab.scale(1, 1.6)
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    fig.savefig(path, dpi=110)
+    fig.savefig(path, dpi=300)
+    fig.savefig(os.path.splitext(path)[0] + ".svg")       # sharp at any size
     if show:
         import signal
         signal.signal(signal.SIGINT, signal.SIG_DFL)      # Tk would otherwise swallow Ctrl+C
