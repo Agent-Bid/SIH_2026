@@ -138,6 +138,9 @@ def main():
     fig.savefig("sim/out/dac_view.png", dpi=110)
     print("plot saved to sim/out/dac_view.png")
     if not a.no_show:
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_DFL)          # Tk would otherwise swallow Ctrl+C
+        print("close the plot window, press q in it, or Ctrl+C here to exit")
         plt.show()
 
 

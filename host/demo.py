@@ -168,6 +168,9 @@ def plot(caps, pings, oks, path, show):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     fig.savefig(path, dpi=110)
     if show:
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_DFL)          # Tk would otherwise swallow Ctrl+C
+        print("close the plot window, press q in it, or Ctrl+C here to exit")
         plt.show()
 
 
