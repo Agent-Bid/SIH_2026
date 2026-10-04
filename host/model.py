@@ -31,9 +31,10 @@ def read_log(path):
     return int(hdr["len"]), int(hdr["win_step"]), inputs, out, act
 
 
-def golden(inputs, length, win_step, window=None, geo=False):
-    """inputs: one (start, ftw_start, ftw_step, amp, code, chip_len) per tick.
-    geo: geometric sweep instead of LFM. Returns (out, active)."""
+def golden(inputs, length, win_step, window=None, geo=False, every=1):
+    """inputs: one (start, ftw_start, ftw_step, amp, code, chip_len) per tick (any iterable).
+    geo: geometric sweep instead of LFM. every: keep one tick in every (for very long pulses).
+    Returns (out, active)."""
     sine = sine_table()
     window = hann_table() if window is None else window
     active = count = ftw = phase = winph = tone = win = tone_r = win_r = shaped = out = 0
@@ -41,7 +42,7 @@ def golden(inputs, length, win_step, window=None, geo=False):
     tick_in_chip = chip = 0
     geo_n = geo_acc = acc = 0
     outs, acts = [], []
-    for start, ftw_start, ftw_step, amp, code, chip_len in inputs:
+    for tick, (start, ftw_start, ftw_step, amp, code, chip_len) in enumerate(inputs):
         run_rst = not active
         flip = (code >> chip) & 1
         if start and not active:
@@ -86,8 +87,9 @@ def golden(inputs, length, win_step, window=None, geo=False):
         geo_n, geo_acc = n_geo_n, n_geo_acc
         tone, win, tone_r, win_r, shaped, out = n_tone, n_win, n_tone_r, n_win_r, n_shaped, n_out
         pair1, pair2 = n_pair1, n_pair2
-        outs.append(out)
-        acts.append(active)
+        if tick % every == 0:
+            outs.append(out)
+            acts.append(active)
     return np.array(outs), np.array(acts)
 
 

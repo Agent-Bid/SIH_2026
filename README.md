@@ -51,6 +51,10 @@ python3 host/capture.py --request                                # capture what 
   (`python3 host/esp_console.py`): `A` automatic (simulated conditions, the default),
   `W` type the inputs, `M geo|bpsk|lfm|cw|auto` force a modulation, `R 450` the target range.
 - The PC talks to the FPGA at 3 Mbaud (`/dev/ttyUSB1`).
+- **The DAC output without a scope**: wire pin 40 → 1 kΩ + 100 pF → 10 kΩ + 10 pF → ESP32
+  GPIO 1, then `python3 host/dac_view.py --amp 1`. The ESP32 records the filtered voltage while
+  the FPGA plays a slow-motion copy of the current ping, and the plot lays it over the FPGA's own
+  samples (`sim/out/dac_view.png`).
 - On the board: **S1** steps through three presets (chirp, geometric, BPSK), **S2** captures
   the next pulse (listen with `python3 host/capture.py`).
 - **Oscilloscope** (no DAC needed): pin 40 → 1 kΩ → probe point, 100 pF from the probe point
@@ -84,3 +88,5 @@ by `host/capture.py`.
 - 2026-09-30: the demo: simulated conditions on the ESP32, 6 pings a second, each a new
   decision; 6 consecutive pings streamed from the FPGA, all bit-exact. This build is in the
   FPGA's flash.
+- 2026-10-04: the sigma-delta DAC's filtered output, recorded by the ESP32's ADC in slow motion,
+  matches the FPGA's samples (correlation 0.998 at full amplitude; BPSK phase flips visible).

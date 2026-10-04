@@ -49,7 +49,7 @@ An underwater sonar transmitter that adapts its waveform to the water conditions
 | Whole system, `host/demo.py` | **Verified (2026-09-30)**: 6 consecutive pings (streamed captures, whole pulses), each a new ESP32 decision (packet numbers one apart), all bit-exact; the conditions recomputed on the PC match the ESP32's log. |
 | ESP32 firmware v3 + ML | 43/43 host tests pass; **flashed and running** (native USB build, `CDCOnBoot=cdc`); starts in automatic mode (simulated conditions) at power-on, with or without a USB host. |
 | Wiring ESP32 ↔ FPGA | Done (pin table in section 6). SCK, MOSI verified with an edge-counting probe; CS picks up only noise (cause not found: ESP32 pin, wire or FPGA pin). |
-| DAC | Not chosen / not connected. The FPGA already drives `dac_d[7:0]` and `dac_clk`. For an oscilloscope without a DAC: `scope_sd` (pin 40, 1-bit sigma-delta, needs 1 kΩ + 100 pF) and `scope_trig` (pin 41), see section 6. Not yet looked at on a scope. |
+| DAC | The DAC0808 board is shelved. **In use: the 1-bit sigma-delta** on pin 40 → 1 kΩ + 100 pF → 10 kΩ + 10 pF → ESP32 GPIO 1. **Verified without a scope (2026-10-04)**: `host/dac_view.py` records the filtered output with the ESP32's ADC during a slow-motion copy of a ping; it matches the FPGA's samples (correlation 0.998 at full amplitude, BPSK phase flips visible). An 8-bit R-2R ladder on `dac_d[7:0]` (R = 1 kΩ, 25 resistors) is the cleaner next step. |
 | Sensors | Simulated (`MCU /SIH/water_sim.h`). No potentiometers wired: in pot mode (`P`) the ESP32's ADC inputs float. |
 | ML model | Three networks in `MCU /SIH/ml_model.h` (profile 6-48-48-6, amplitude 12-48-48-1, modulation 16-32-32-3), `USE_ML_MODEL 1`. Profile agrees with the physics on 99.2–99.4 %, 0.5 % overridden; amplitude within 1.8 % (median), 1.6–3.4 % extra energy; modulation agrees on 99.7 %, 0.2 % overridden. **Running on the ESP32.** |
 | Git | Committed. |
@@ -91,6 +91,7 @@ Run everything from this folder (the project root): scripts and `$readmemh` use 
 | `host/demo.py` | One second of the running system: streams 6 consecutive pings, checks them, plots them on one graph with a table of conditions and choices (`sim/out/demo.png`) |
 | `host/water_sim.py` | Python twin of the ESP32's simulated conditions: the conditions behind a packet, from its sequence number |
 | `host/esp_console.py` | Terminal for the ESP32's serial console that does not reset it |
+| `host/dac_view.py` | Before vs after the DAC without a scope: ESP32 ADC recording of the filtered sigma-delta output (slow motion) against the golden model |
 | `host/check_*.py` | Checkers for the unit testbenches; `check_water_sim.py` compares `water_sim.py` with the C++ |
 | `sim/run`, `sim/all` | Run one testbench / all testbenches with their checkers |
 | `sim/*_tb.v` | Testbenches (see section 9) |
@@ -243,7 +244,7 @@ there. Pins 59–62 are the on-board flash.
 | `spi_mosi` | 37 | ESP32 GPIO12 |
 | `spi_sck` | 38 (pull-down) | ESP32 GPIO13 |
 | (unused) | 39 | ESP32 GPIO11 (MISO) |
-| `scope_sd` | 40 | oscilloscope: 1 kΩ in series, 100 pF to GND, probe across the capacitor |
+| `scope_sd` | 40 | 1 kΩ + 100 pF, then 10 kΩ + 10 pF (two RC stages) → ESP32 GPIO 1 (ADC) and/or a scope probe |
 | `scope_trig` | 41 | oscilloscope trigger: high during each pulse |
 | GND | GND | ESP32 GND — required |
 
@@ -353,6 +354,13 @@ H 270–330 kHz, M 180–220 kHz, L 100–140 kHz, each with 1 / 5 / 20 ms pulse
   the same on one line, ending with a `DECISION` line.
 - `R <metres>`, `M lfm | geo | bpsk | cw | auto` (force a modulation; `auto` = from the
   motion), `P` (potentiometers), `L` (status line), `?`.
+- `C [amp]`: **DAC view.** Sends the FPGA a slow-motion copy of the current ping (every
+  frequency ÷ N, pulse × N, N ≤ 100 so the length fits 24 bits; period 1.5 × length; optional
+  amplitude), holds it (`gCapture`) while recording GPIO 1 with the ADC in continuous mode (≤ 80
+  kS/s, ≤ 50,000 samples, calibrated to mV, a window of 2.7 pulse lengths so one whole pulse is
+  inside), then prints `CAP key=value …` (the packet's FPGA fields), `D` lines of 3-digit hex mV,
+  and `END`. The ADC continuous driver cannot start if the potentiometer mode (one-shot ADC)
+  was used since power-on: reset the ESP32 first. `host/dac_view.py [--amp 1]` runs it and plots.
 - The console writes in 32-byte pieces and waits for each to leave: the USB-Serial/JTAG
   driver loses text when it is queued faster, and `Serial.flush()` can discard it.
 
@@ -416,6 +424,7 @@ sim/run top_tb -w                        # one testbench, then GTKWave
 tn9k load                                # build + load the FPGA (SRAM)
 python3 host/demo.py                     # one second of the running system (ESP32 + FPGA), 6 pings
 python3 host/check_water_sim.py          # the PC's copy of the simulated conditions matches the C++
+python3 host/dac_view.py --amp 1         # the sigma-delta DAC's filtered output vs the FPGA's samples (no scope)
 python3 host/wavegen.py geo --fc 325e3 --bw 350e3 --capture   # PC sets a waveform, captures, checks
 python3 host/capture.py --request        # capture whatever is playing now (e.g. the ESP32's choice)
 python3 host/capture.py                  # wait for S2 presses
@@ -444,9 +453,13 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
 1. **CS line**: the ESP32 → FPGA link works without it (framed by the pause after each
    burst). Finding out why GPIO14 → pin 36 carries only noise (ESP32 pin, jumper or FPGA pin; a
    GPIO14 toggle test with the pin probe would tell) is optional.
-2. **Choose the DAC**: it must take 8-bit parallel data at 50 MS/s (or the FPGA must slow its
-   output rate), and its latch edge must match `dac_clk`. Until then, look at the waveforms on
-   an oscilloscope through `scope_sd` (section 6).
+2. **Choose the DAC**: the DAC0808 + TL084 Butterworth board needs a −5 V charge pump, faster
+   op-amps (OPA4350), U5A's feedback moved to its − input, a 13-clock sample hold in the FPGA
+   (3.857 MS/s) and a bit-order check; shelved for now. Meanwhile the sigma-delta (pin 40) works,
+   and an 8-bit R-2R on `dac_d[7:0]` would be cleaner. For the transmitter, a single-supply
+   high-speed DAC (DAC908 / AD9708 class) fits `dac_d` + `dac_clk` directly.
+   `dac_view.py` shows the DAC output's shape but not the filter's effect at 100–500 kHz (the slow
+   copy is at 1–5 kHz); that still needs a scope.
 3. **Doppler thresholds** (`DOPPLER_BPSK_MAX_CYCLES` 0.25, `DOPPLER_LFM_MAX_CYCLES` 1): set
    from rules of thumb; confirm with the team (and retrain after a change). The speed input is
    simulated; a real one needs a DVL or a Doppler estimate from echoes.

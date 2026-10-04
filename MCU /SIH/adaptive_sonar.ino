@@ -21,6 +21,9 @@
   does not reset the board):
       A          -> automatic: simulated water conditions (the default); prints one PING
                     line per ping
+      C [amp]    -> DAC view: records the DAC filter output on GPIO 1 during a slow-motion copy
+                    of the current ping, optionally at another amplitude 0..1 (host/dac_view.py
+                    in the FPGA project plots it)
       Enter or W -> type new inputs: it asks for each value, then prints the decision
       I 15 35 50 20 100 300 0.5 -> all seven inputs on one line (temperature, salinity, depth,
                     turbidity, battery, range, speed); the report ends with a DECISION line
@@ -37,6 +40,14 @@
 #include "sonar_config.h"
 #include "sonar_core.h"
 #include "water_sim.h"
+#if __has_include("esp_adc/adc_continuous.h")
+#include "esp_adc/adc_continuous.h"
+#include "esp_adc/adc_cali_scheme.h"
+#include "esp_timer.h"
+#define HAVE_ADC_CAPTURE 1
+#else
+#define HAVE_ADC_CAPTURE 0
+#endif
 
 // 1 = the ML model picks the profile, its amplitude and the modulation (ml_model.h, see ml/); the
 //     physics keeps the profile when it closes the link within the energy allowance and overrides
@@ -100,6 +111,7 @@ static QueueHandle_t qPing   = NULL;   // every decision, for the PING log
 static volatile uint32_t gTargetRangeM = DEFAULT_TARGET_RANGE_M;  // aligned 32-bit write is atomic
 static volatile int32_t  gModulation   = -1;   // M command: -1 = auto (from the motion), else Modulation
 static volatile bool     gSim          = true;   // A command: simulated water conditions (water_sim.h)
+static volatile bool     gCapture      = false;  // C command running: the decision task leaves the packet alone
 static volatile bool     gUsePots      = false;  // P command: potentiometers, else typed inputs
 static volatile bool     gLive         = false;  // L command: status line every LOG_PERIOD_MS
 
@@ -237,7 +249,7 @@ static void decisionTask(void *) {
       last = d.profile;
       const int32_t forced = gModulation;
       const sonar::SonarPacket pkt = sonar::buildPacket(d, seq, forced);
-      xQueueOverwrite(qPacket, &pkt);
+      if (!gCapture) xQueueOverwrite(qPacket, &pkt);
       const Telemetry t = { env, d, pkt, r, stale, forced, version, ml, who, missionS };
       xQueueOverwrite(qTelem, &t);
       xQueueSend(qPing, &t, 0);
@@ -318,6 +330,7 @@ static void printPrompt() {
 
 static void printHelp() {
   out("\n  A            automatic: simulated water conditions, one PING line per ping\n");
+  out("  C [amp]      DAC view: record GPIO 1 during a slow-motion copy of the current ping\n");
   out("  Enter or W   type new inputs (Enter keeps a value, q cancels)\n");
   out("  R <metres>   target range, e.g. R 450\n");
   out("  M <mod>      modulation: auto (from the motion) | lfm | geo | bpsk | cw\n");
@@ -385,10 +398,126 @@ static void answerField(const char *w) {
   else finishAsking();
 }
 
+// DAC view (C command): records the DAC filter's output on GPIO 1 with the ESP32's ADC. The ADC
+// (80 kS/s at most) is far too slow for 100-500 kHz, so the FPGA is sent a slow-motion copy of the
+// current waveform: every frequency divided by N and the pulse N times longer (N up to 100), which it
+// plays through the real sigma-delta and filter. host/dac_view.py plots it against the FPGA's samples.
+#define DAC_VIEW_ADC_CHANNEL  0          // GPIO 1 = ADC1 channel 0
+#define DAC_VIEW_MAX_SAMPLES  50000
+#define DAC_VIEW_MAX_RATE     80000
+
+static bool slowPacket(const Telemetry &t, float amp, sonar::SonarPacket &k, int &n) {
+  WaveProfile p = sonar::withModulation(PROFILES[t.dec.profile], t.pkt.modulation);
+  n = (int)fmin(100.0, floor((double)FPGA_LEN_MAX_CLK / (p.pulseS * FPGA_CLK_HZ * 1.02)));
+  if (n < 2) return false;
+  p.fcHz /= n;
+  p.bwHz /= n;
+  p.pulseS *= n;
+  const sonar::FpgaWave w = sonar::fpgaWave(p);
+  if (!w.fits) return false;
+  k = t.pkt;
+  k.lenClk    = w.lenClk;
+  k.ftwStart  = w.ftwStart;
+  k.ftwStep   = w.ftwStep;
+  k.winStep   = w.winStep;
+  k.code      = w.code;
+  k.chipLen   = w.chipLen;
+  k.periodClk = w.lenClk + w.lenClk / 2;
+  if (amp > 0.0f) k.ampQ12 = (uint16_t)lroundf(sonar::clampf(amp, 0.0f, 1.0f) * 4096.0f);
+  k.crc8      = sonar::crc8((const uint8_t *)&k, sizeof(k) - 1);
+  return true;
+}
+
+static void captureDac(float amp) {
+#if HAVE_ADC_CAPTURE
+  Telemetry t;
+  sonar::SonarPacket k;
+  int n;
+  if (xQueuePeek(qTelem, &t, 0) != pdTRUE) { out("CAPERR no decision yet\n"); return; }
+  if (!slowPacket(t, amp, k, n)) { out("CAPERR this waveform does not fit in slow motion\n"); return; }
+  const double window = 2.7 * k.lenClk / FPGA_CLK_HZ;        // a whole pulse fits, whatever its phase
+  const uint32_t rate = (uint32_t)fmin((double)DAC_VIEW_MAX_RATE, DAC_VIEW_MAX_SAMPLES / window);
+  const uint32_t want = (uint32_t)(rate * window);
+  uint16_t *mv = (uint16_t *)malloc(want * sizeof(uint16_t));
+  if (!mv) { out("CAPERR out of memory\n"); return; }
+
+  gCapture = true;                       // the slow copy replaces the packet; the FPGA takes it when idle
+  xQueueOverwrite(qPacket, &k);
+  vTaskDelay(pdMS_TO_TICKS(60));
+
+  adc_continuous_handle_t adc = NULL;
+  adc_cali_handle_t cali = NULL;
+  adc_continuous_handle_cfg_t hc = {};
+  hc.max_store_buf_size = 8192;
+  hc.conv_frame_size = 256;
+  adc_digi_pattern_config_t pat = {};
+  pat.atten = ADC_ATTEN_DB_12;
+  pat.channel = DAC_VIEW_ADC_CHANNEL;
+  pat.unit = ADC_UNIT_1;
+  pat.bit_width = SOC_ADC_DIGI_MAX_BITWIDTH;
+  adc_continuous_config_t cc = {};
+  cc.pattern_num = 1;
+  cc.adc_pattern = &pat;
+  cc.sample_freq_hz = rate;
+  cc.conv_mode = ADC_CONV_SINGLE_UNIT_1;
+  cc.format = ADC_DIGI_OUTPUT_FORMAT_TYPE2;
+  adc_cali_curve_fitting_config_t cf = {};
+  cf.unit_id = ADC_UNIT_1;
+  cf.chan = (adc_channel_t)DAC_VIEW_ADC_CHANNEL;
+  cf.atten = ADC_ATTEN_DB_12;
+  cf.bitwidth = ADC_BITWIDTH_12;
+  bool ok = adc_continuous_new_handle(&hc, &adc) == ESP_OK && adc_continuous_config(adc, &cc) == ESP_OK
+         && adc_cali_create_scheme_curve_fitting(&cf, &cali) == ESP_OK;
+  const bool started = ok && adc_continuous_start(adc) == ESP_OK;
+  ok = started;
+  uint32_t got = 0;
+  const int64_t t0 = esp_timer_get_time();
+  uint8_t frame[256];
+  while (ok && got < want) {
+    uint32_t len = 0;
+    if (adc_continuous_read(adc, frame, sizeof frame, &len, 1000) != ESP_OK) { ok = false; break; }
+    for (uint32_t i = 0; i + SOC_ADC_DIGI_RESULT_BYTES <= len && got < want; i += SOC_ADC_DIGI_RESULT_BYTES) {
+      const adc_digi_output_data_t *d = (const adc_digi_output_data_t *)&frame[i];
+      if (d->type2.channel != DAC_VIEW_ADC_CHANNEL) continue;
+      int v = 0;
+      adc_cali_raw_to_voltage(cali, d->type2.data, &v);
+      mv[got++] = (uint16_t)v;
+    }
+  }
+  const double secs = (esp_timer_get_time() - t0) / 1e6;
+  if (started) adc_continuous_stop(adc);
+  if (adc) adc_continuous_deinit(adc);
+  if (cali) adc_cali_delete_scheme_curve_fitting(cali);
+  gCapture = false;
+  if (!ok) { free(mv); out("CAPERR ADC failed (was potentiometer mode used since power-on? reset the ESP32)\n"); return; }
+
+  out("CAP n=%lu rate=%lu meas=%.1f slow=%d mod=%u len=%lu ftw_start=%lu ftw_step=%ld win_step=%lu amp=%u"
+      " code=%u chip=%lu period=%lu profile=%s\n", (unsigned long)got, (unsigned long)rate, got / secs, n,
+      k.modulation, (unsigned long)k.lenClk, (unsigned long)k.ftwStart, (long)k.ftwStep,
+      (unsigned long)k.winStep, k.ampQ12, k.code, (unsigned long)k.chipLen, (unsigned long)k.periodClk,
+      PROFILES[t.dec.profile].name);
+  char line[4 + 3 * 32];
+  for (uint32_t i = 0; i < got; i += 32) {
+    int p = snprintf(line, sizeof line, "D ");
+    for (uint32_t j = i; j < got && j < i + 32; j++) p += snprintf(line + p, sizeof line - p, "%03X", mv[j] & 0xFFF);
+    out("%s\n", line);
+  }
+  out("END\n");
+  free(mv);
+#else
+  (void)amp;
+  out("CAPERR not supported on this build\n");
+#endif
+}
+
 static void handleCommand(char *w) {
   const char c = *w;
   if (c == 0 && gSim) return;                              // Enter alone does not stop the simulation
   if (c == 0 || c == 'W' || c == 'w') { startAsking(); return; }
+  if (c == 'C' || c == 'c') {
+    captureDac(strtof(w + 1, nullptr));                     // no number: 0 = keep the ping's own amplitude
+    return;
+  }
   if (c == 'A' || c == 'a') {
     gSim = true;
     gAsk = -1;
