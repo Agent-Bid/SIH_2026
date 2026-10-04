@@ -8,6 +8,7 @@ graph whose time axis skips the baseline between pings.
   python3 host/dac_sequence.py --reps 1        # faster, noisier
   python3 host/dac_sequence.py --no-show       # only save sim/out/dac_sequence.png
   python3 host/dac_sequence.py --replot        # redraw the last recording (sim/out/dac_sequence.pkl)
+  python3 host/dac_sequence.py --replot --tall # the same as a tall picture, one row per ping
 
 Wiring as for host/dac_view.py: pin 40 -> 1 kOhm + 100 pF -> 10 kOhm + 10 pF -> ESP32 GPIO 1.
 """
@@ -183,6 +184,74 @@ def plot(pings, results, reps, path, show):
         plt.show()
 
 
+def plot_tall(pings, results, reps, path, show):
+    """The same, laid out for a tall narrow space (a portrait slide column): one row per ping."""
+    import matplotlib
+    if not show:
+        matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.lines import Line2D
+    n = len(pings)
+    c_before, c_after = "#2a78d6", "#eb6834"
+    fig = plt.figure(figsize=(9, 14.5))
+    gs = fig.add_gridspec(n, 2, left=0.09, right=0.98, top=0.915, bottom=0.2, wspace=0.12, hspace=0.75,
+                          width_ratios=[2.3, 1])
+    dev = max(np.abs(np.concatenate([r[1], r[2]]) - VDD / 2).max() for r in results)
+    axes = []
+    for i, (p, (t_ms, expect, after, corr)) in enumerate(zip(pings, results)):
+        c, info = p["cond"], p["info"]
+        ax = fig.add_subplot(gs[i, 0], sharey=axes[0] if axes else None)
+        axes.append(ax)
+        ax.plot(t_ms, expect, lw=0.8, color=c_before)
+        ax.plot(t_ms, after, lw=0.6, color=c_after, alpha=0.85)
+        ax.set_title(f"{i * PING_PERIOD_MS:.0f} ms   {c['profile']} {MOD_NAME.get(c['mod'], c['mod'])}"
+                     f" · amp {float(c['amp']):.2f}", fontsize=11, fontweight="bold", loc="left")
+        ax.set_xlim(0, t_ms[-1])
+        ax.set_ylabel("V", fontsize=9)
+        ax.tick_params(labelsize=8)
+        ax.set_xlabel("ms", fontsize=8, labelpad=1)
+        f0 = hz(int(info["ftw_start"])) * int(info["slow"])
+        chip_ms = int(info["chip"]) / F_CLK / int(info["slow"]) * 1e3
+        centre = 5 * chip_ms if int(info["code"]) else t_ms[-1] / 2
+        half = 4 / f0 * 1e3
+        k = (t_ms > centre - half) & (t_ms < centre + half)
+        axz = fig.add_subplot(gs[i, 1])
+        axz.plot(t_ms[k] * 1e3, expect[k], lw=1.2, color=c_before)
+        axz.plot(t_ms[k] * 1e3, after[k], ".-", lw=0.7, ms=2.5, color=c_after)
+        axz.set_title("close-up", fontsize=9, loc="left")
+        axz.set_xlabel("µs", fontsize=8, labelpad=1)
+        axz.tick_params(labelsize=7)
+        axz.xaxis.set_major_locator(plt.MaxNLocator(4))
+        axz.yaxis.set_major_locator(plt.MaxNLocator(3))
+    axes[0].set_ylim(VDD / 2 - 1.15 * dev, VDD / 2 + 1.15 * dev)
+    fig.suptitle("One second of pings through the DAC", fontsize=15, fontweight="bold", y=0.99)
+    fig.legend([Line2D([], [], color=c_before, lw=3), Line2D([], [], color=c_after, lw=3)],
+               ["Blue: FPGA output (before the DAC)", "Orange: measured DAC output (after the filter)"],
+               loc="upper center", bbox_to_anchor=(0.5, 0.968), ncol=1, fontsize=10.5, frameon=False)
+
+    cols = ["ping", "contact", "range m", "speed m/s", "depth m", "temp C", "battery %", "waveform",
+            "frequency", "match"]
+    rows = []
+    for i, (p, r) in enumerate(zip(pings, results)):
+        c, info = p["cond"], p["info"]
+        rows.append([str(i + 1), c["contact"], c["R"], c["v"], c["D"], c["T"], c["bat"],
+                     f"{c['profile']} {MOD_NAME.get(c['mod'], c['mod'])}", band(info), f"{r[3]:.3f}"])
+    axt = fig.add_axes([0.01, 0.005, 0.98, 0.14])
+    axt.axis("off")
+    tab = axt.table(cellText=rows, colLabels=cols, loc="center", cellLoc="center")
+    tab.auto_set_font_size(False)
+    tab.set_fontsize(9.5)
+    tab.auto_set_column_width(list(range(len(cols))))
+    tab.scale(1.17, 1.6)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fig.savefig(path, dpi=130)
+    if show:
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_DFL)      # Tk would otherwise swallow Ctrl+C
+        print("close the plot window, press q in it, or Ctrl+C here to exit")
+        plt.show()
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--esp", default="/dev/ttyACM0", help="the ESP32's USB port")
@@ -190,14 +259,16 @@ def main():
     ap.add_argument("--reps", type=int, default=4, help="recordings per ping, averaged")
     ap.add_argument("--no-show", action="store_true", help="only save the picture")
     ap.add_argument("--replot", action="store_true", help="redraw the last recording without recording again")
+    ap.add_argument("--tall", action="store_true", help="portrait layout, one row per ping (dac_sequence_tall.png)")
     a = ap.parse_args()
     saved = "sim/out/dac_sequence.pkl"
+    draw, out = (plot_tall, "sim/out/dac_sequence_tall.png") if a.tall else (plot, "sim/out/dac_sequence.png")
 
     if a.replot:
         with open(saved, "rb") as f:
             pings, results, reps = pickle.load(f)
-        plot(pings, results, reps, "sim/out/dac_sequence.png", show=not a.no_show)
-        print("plot saved to sim/out/dac_sequence.png")
+        draw(pings, results, reps, out, show=not a.no_show)
+        print(f"plot saved to {out}")
         return
     print(f"recording {a.pings} pings x {a.reps} in slow motion on the ESP32...", flush=True)
     pings = record(a.esp, a.pings, a.reps)
@@ -212,8 +283,8 @@ def main():
         c = p["cond"]
         print(f"  ping {i + 1}: {c['contact']} at {c['R']} m, {float(c['v']):.2f} m/s -> {c['profile']} "
               f"{MOD_NAME.get(c['mod'], c['mod'])}, amp {float(c['amp']):.2f}; match {r[3]:.3f}")
-    plot(pings, results, a.reps, "sim/out/dac_sequence.png", show=not a.no_show)
-    print("plot saved to sim/out/dac_sequence.png")
+    draw(pings, results, a.reps, out, show=not a.no_show)
+    print(f"plot saved to {out}")
 
 
 if __name__ == "__main__":
