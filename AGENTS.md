@@ -49,7 +49,7 @@ An underwater sonar transmitter that adapts its waveform to the water conditions
 | Whole system, `host/demo.py` | **Verified (2026-09-30)**: 6 consecutive pings (streamed captures, whole pulses), each a new ESP32 decision (packet numbers one apart), all bit-exact; the conditions recomputed on the PC match the ESP32's log. |
 | ESP32 firmware v3 + ML | 43/43 host tests pass; **flashed and running** (native USB build, `CDCOnBoot=cdc`); starts in automatic mode (simulated conditions) at power-on, with or without a USB host. |
 | Wiring ESP32 ↔ FPGA | Done (pin table in section 6). SCK, MOSI verified with an edge-counting probe; CS picks up only noise (cause not found: ESP32 pin, wire or FPGA pin). |
-| DAC | The DAC0808 board is shelved. **In use: the 1-bit sigma-delta** on pin 40 → 1 kΩ + 100 pF → 10 kΩ + 10 pF → ESP32 GPIO 1. **Verified without a scope (2026-10-04)**: `host/dac_view.py` records the filtered output with the ESP32's ADC during a slow-motion copy of a ping; it matches the FPGA's samples (correlation 0.998 at full amplitude, BPSK phase flips visible). An 8-bit R-2R ladder on `dac_d[7:0]` (R = 1 kΩ, 25 resistors) is the cleaner next step. |
+| DAC | The DAC0808 board is shelved. **In use: the 1-bit sigma-delta** on pin 40 → 1 kΩ + 100 pF → 10 kΩ + 10 pF → ESP32 GPIO 1. **Verified without a scope (2026-10-04)**: `host/dac_view.py` records the filtered output with the ESP32's ADC during a slow-motion copy of a ping; it matches the FPGA's samples (correlation 0.998 at full amplitude, BPSK phase flips visible). An 8-bit R-2R ladder on `dac_d[7:0]` (R = 1 kΩ, 25 resistors) is the cleaner next step. **Now (2026-10-05)**: RC → OPA340 Sallen-Key on the LASC board, a second-order sigma-delta, and a BlackPill recording at 2.4 MS/s (`host/real_speed.py`). Against first order on the same fixed pings: leftover noise 28 → 22, 16 → 13 and 17 → 12.5 mV rms (120, 300, 440 kHz); the 440 kHz amp-0.05 ping's match 0.87 → 0.93. The BlackPill's own floor is about 9–10 mV rms. |
 | Sensors | Simulated (`MCU /SIH/water_sim.h`). No potentiometers wired: in pot mode (`P`) the ESP32's ADC inputs float. |
 | ML model | Three networks in `MCU /SIH/ml_model.h` (profile 6-48-48-6, amplitude 12-48-48-1, modulation 16-32-32-3), `USE_ML_MODEL 1`. Profile agrees with the physics on 99.2–99.4 %, 0.5 % overridden; amplitude within 1.8 % (median), 1.6–3.4 % extra energy; modulation agrees on 99.7 %, 0.2 % overridden. **Running on the ESP32.** |
 | Git | Committed. |
@@ -75,7 +75,7 @@ Run everything from this folder (the project root): scripts and `$readmemh` use 
 | `phase_code.v` | BPSK chip counter: `flip = code[chip]` |
 | `dds.v`, `phase_acc.v` | Phase accumulator + 1024-entry sine table (with a phase offset input for BPSK) |
 | `scale.v` | Fixed-point multiply: `out = in × factor / 4096`, 2 clocks (split into two small products) |
-| `sigma_delta.v` | 1-bit DAC (first-order sigma-delta) of the waveform, for an oscilloscope |
+| `sigma_delta.v` | 1-bit DAC of the waveform: second-order sigma-delta by default (input limited to ±95 %), `ORDER=1` for the original first-order one |
 | `spi_rx.v` | SPI slave (mode 0) that collects one packet, framed by CS or (as used now) by the pause after each burst |
 | `pkt_check.v` | Checks sync, version and CRC-8 of a packet, one byte per clock |
 | `uart_rx.v`, `uart_tx.v`, `cmd_rx.v` | USB UART (3 Mbaud 8N1) and its command frames |
@@ -251,7 +251,7 @@ there. Pins 59–62 are the on-board flash.
 | GND | GND | ESP32 GND — required |
 
 **Oscilloscope without a DAC**: `scope_sd` is the waveform as a 1-bit stream at 50 MHz (a
-first-order sigma-delta: the share of 1s follows the sample). Through 1 kΩ + 100 pF (cut-off
+second-order sigma-delta since 2026-10-05: the share of 1s follows the sample). Through 1 kΩ + 100 pF (cut-off
 ≈ 1.6 MHz) it becomes the analog waveform, window and amplitude included (simulated ripple
 ≈ 11 % of the amplitude). Unfiltered, it looks like a band of fast pulses; a DSO's averaging
 (triggered on `scope_trig`) may still show the shape. With no parts at all, `dac_d[7]`
@@ -450,7 +450,7 @@ Plots go to `sim/out/board_capture_<kind>.png` (waveform + spectrogram with the 
 | `chirp_tb` | LFM up and down, 3 ↔ 7 MHz, bit-exact + measured sweep |
 | `geo_tb` | geometric 2 → 8 MHz, bit-exact + measured: exactly two octaves |
 | `bpsk_tb` | Barker-13, bit-exact + code read back from the samples |
-| `sigma_delta_tb` | scope output: bit-exact sigma-delta of a chirp; after a simulated 1 kΩ + 100 pF it follows the waveform (ripple < 15 %) |
+| `sigma_delta_tb` | scope output: first- and second-order bit streams of a chirp both bit-exact against their models; after a simulated 1 kΩ + 100 pF it follows the waveform (ripple < 15 %) |
 | `top_tb` | whole board: UART chirp, SPI packet with bad CRC (rejected) + good geometric packet, UART BPSK; three captures checked by `capture.py` |
 
 ---

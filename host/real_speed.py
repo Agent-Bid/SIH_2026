@@ -94,7 +94,10 @@ def match(args):
     before = fpga_samples(info_of(f), STEP)
     t_pulse = min(f["len"] / F_CLK, (len(counts) - 1) / rate * 0.95)
     volts = counts / 4095 * VDD
-    score, r, lag, m = align(volts, before, STEP / F_CLK, rate, t_pulse)
+    # the BlackPill's crystal and the FPGA's agree to a fraction of a per mille, but over a whole pulse
+    # even 0.01 % is a visible slip at 2.4 MS/s: search finely, then more finely
+    score, r, lag, m = align(volts, before, STEP / F_CLK, rate, t_pulse, spread=0.002, steps=41)
+    score, r, lag, m = align(volts, before, STEP / F_CLK, r, t_pulse, spread=0.0001, steps=41)
     after = volts[lag:lag + m]
     t = np.arange(m) / r
     expect = np.interp(t, np.arange(len(before)) * STEP / F_CLK, before)

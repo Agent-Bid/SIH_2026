@@ -1,6 +1,7 @@
 `timescale 1ns/1ps
 // The oscilloscope output: a windowed LFM chirp 150 -> 500 kHz (16000 ticks) through pulse_dds and
-// the sigma-delta 1-bit DAC. Logs the sample and the output bit every tick.
+// the sigma-delta 1-bit DAC, first and second order side by side. Logs the sample and both
+// output bits every tick.
 // Check with: python3 host/check_sigma_delta.py
 module sigma_delta_tb;
 
@@ -14,13 +15,14 @@ module sigma_delta_tb;
     reg                sd_rst = 1;                  // held until pulse_dds' pipeline has filled
     reg                start = 0;
     wire signed [11:0] out;
-    wire               active, bit_out;
+    wire               active, bit1, bit2;
 
     pulse_dds dut (.clk(clk), .rst(rst), .start(start), .len(LEN),
                    .ftw_start(F150K), .ftw_step(STEP), .geo(1'b0),
                    .code(16'd0), .chip_len(24'd0),
                    .win_step(WIN_STEP), .amp(13'd4096), .out(out), .active(active));
-    sigma_delta sd (.clk(clk), .rst(sd_rst), .in(out), .out(bit_out));
+    sigma_delta #(.ORDER(1)) sd1 (.clk(clk), .rst(sd_rst), .in(out), .out(bit1));
+    sigma_delta #(.ORDER(2)) sd2 (.clk(clk), .rst(sd_rst), .in(out), .out(bit2));
 
     always #10 clk = ~clk;
 
@@ -30,9 +32,9 @@ module sigma_delta_tb;
         repeat (5) @(negedge clk);
         rst = 0;
         repeat (10) @(negedge clk);
-        sd_rst = 0;                                  // log from here: the accumulator is 0
+        sd_rst = 0;                                  // log from here: the accumulators are 0
         for (i = 0; i < 16220; i = i + 1) begin
-            $fdisplay(fd, "%0d %0d", out, bit_out);
+            $fdisplay(fd, "%0d %0d %0d", out, bit1, bit2);
             start = (i == 10);
             @(negedge clk);
         end

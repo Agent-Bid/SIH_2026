@@ -59,12 +59,12 @@ def fpga_samples(info, step):
     return (np.asarray(out, dtype=float) + 2048) / 4096 * VDD
 
 
-def align(after, before, before_dt, rate, t_pulse):
-    """Find the ADC's true sample rate (within +-5 %) and where the pulse starts in the recording,
-    by correlating the measured voltage with the expected one."""
+def align(after, before, before_dt, rate, t_pulse, spread=0.05, steps=101):
+    """Find the ADC's true sample rate (within +-spread) and where the pulse starts in the
+    recording, by correlating the measured voltage with the expected one."""
     a = after - after.mean()
     best = None
-    for r in rate * np.linspace(0.95, 1.05, 101):
+    for r in rate * np.linspace(1 - spread, 1 + spread, steps):
         m = int(t_pulse * r)
         if m >= len(a):
             continue
