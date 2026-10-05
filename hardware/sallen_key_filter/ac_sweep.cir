@@ -1,0 +1,27 @@
+* AC sweep of the output filter (Sallen-Key.kicad_sch): how much of each frequency gets through.
+*   ngspice ac_sweep.cir
+* The op-amp is modelled as a single pole with the OPA340's 5.5 MHz gain-bandwidth.
+* Uncomment CSTRAY to add the ~10 pF of wiring capacitance that the perfboard build has at +IN.
+VIN in 0 DC 1.65 AC 1
+R1 in a 1k
+C1 a 0 100p
+R2 a b 10k
+C3 b out_op 100p
+R3 b p 1k
+C2 p 0 20p
+*CSTRAY p 0 10p
+EAMP x 0 p out_op 1e5
+RP x y 1k
+CP y 0 2.894u
+EBUF out_op 0 y 0 1
+R4 out_op out 10k
+C4 out 0 10p
+.ac dec 50 10k 10meg
+.control
+run
+meas ac g120k find vm(out_op) at=120k
+meas ac g300k find vm(out_op) at=300k
+meas ac g440k find vm(out_op) at=440k
+plot vdb(out_op) vdb(out) xlog
+.endc
+.end

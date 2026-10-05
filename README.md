@@ -65,6 +65,9 @@ python3 host/capture.py --request                                # capture what 
   BlackPill (`blackpill/`, flash with `pio run -t upload` in DFU mode) records it at 2.4 MS/s on
   PA1, triggered by pin 41 on PB0. `python3 host/real_speed.py` records 6 consecutive pings, pairs
   each with the FPGA's header for that pulse and plots them unslowed (`sim/out/real_speed.png`).
+- **Filter design files**: `hardware/sallen_key_filter/` holds the KiCad schematic of the output
+  filter (RC, OPA340 Sallen-Key, RC) and `ac_sweep.cir`, an ngspice AC sweep of it
+  (`ngspice ac_sweep.cir`).
 - On the board: **S1** steps through three presets (chirp, geometric, BPSK), **S2** captures
   the next pulse (listen with `python3 host/capture.py`).
 - **Oscilloscope** (no DAC needed): pin 40 → 1 kΩ → probe point, 100 pF from the probe point
