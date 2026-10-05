@@ -15,6 +15,8 @@
  *   C [n] [pre]          the next pulse: n samples (default 4800 = 2 ms), pre of them before it
  *   S [k] [n] [pre]      the next k consecutive pulses (default 6), each sent as soon as it is in
  *   P <0|1>              record PA0 or PA1
+ *   T <0..7>             ADC sampling time: 3, 15, 28, 56, 84, 112, 144, 480 ADC clocks (default 0 = 3,
+ *                        2.4 MS/s; longer is slower but gives the input more time to settle)
  *   ?                    status
  * Each recording is a text line "CAP i=.. n=.. pre=.. rate=.. ch=.. t_us=..", then n
  * little-endian 16-bit samples (12-bit ADC counts), then "\nEND\n". A sequence ends with "SEQEND".
@@ -28,6 +30,7 @@ static uint16_t buf[BUF_N] __attribute__((aligned(4)));
 static volatile int32_t trigAt = -1;    // buffer index at the trigger, -1 = not yet
 static volatile bool armed = false;
 static uint8_t channel = 1;
+static uint8_t smp = 0;                 // sampling time code, see the T command
 static float rate = 0;                  // measured samples per second
 
 // 72 MHz from the 25 MHz crystal (USB still gets its 48 MHz); APB2 = 72 MHz, ADC = APB2 / 2 = 36 MHz
@@ -61,13 +64,20 @@ static void adcStop() {
   while (DMA2_Stream0->CR & DMA_SxCR_EN) {}
 }
 
+static void setSampling(uint8_t code) {
+  smp = code & 7;
+  uint32_t r = 0;
+  for (int ch = 0; ch < 10; ch++) r |= (uint32_t)smp << (3 * ch);
+  ADC1->SMPR2 = r;
+}
+
 static void adcInit() {
   RCC->APB2ENR |= RCC_APB2ENR_ADC1EN;
   RCC->AHB1ENR |= RCC_AHB1ENR_DMA2EN | RCC_AHB1ENR_GPIOAEN;
   GPIOA->MODER |= (3u << 0) | (3u << 2);                  // PA0, PA1 analog
   ADC->CCR = ADC->CCR & ~ADC_CCR_ADCPRE;                   // ADC clock = PCLK2 / 2
   ADC1->CR1 = 0;                                           // 12 bits
-  ADC1->SMPR2 = 0;                                         // 3-cycle sampling: 15 clocks a sample
+  setSampling(0);                                          // 3-cycle sampling: 15 clocks a sample
   ADC1->SQR1 = 0;                                          // one channel
 }
 
@@ -165,6 +175,11 @@ static void handle(char *line) {
       send(i, n, pre, tUs);
     }
     if (c == 'S' || c == 's') Serial.print("SEQEND\n");
+  } else if (c == 'T' || c == 't') {
+    static const uint16_t CYCLES[8] = {3, 15, 28, 56, 84, 112, 144, 480};
+    setSampling(strtoul(p, nullptr, 10));
+    measureRate();
+    Serial.printf("sampling %u ADC clocks, rate=%lu\n", CYCLES[smp], (unsigned long)lroundf(rate));
   } else if (c == 'P' || c == 'p') {
     channel = strtoul(p, nullptr, 10) ? 1 : 0;
     Serial.printf("recording PA%u\n", channel);
