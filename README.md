@@ -10,6 +10,10 @@ A PC can stand in for the ESP32 over the Tang Nano's USB UART, and can capture p
 from the FPGA (one, or every ping) to check them sample for sample against a Python golden
 model.
 
+**Technical documentation** (problem, scientific basis, design, results, limitations, references):
+[`docs/Adaptive_Sonar_Technical_Documentation.pdf`](docs/Adaptive_Sonar_Technical_Documentation.pdf)
+(also as `.docx`).
+
 **Full project details** (design, packet format, pins, toolchain quirks, status, open items):
 [`AGENTS.md`](AGENTS.md). ESP32 firmware and its physics write-up: `MCU /SIH/`.
 
